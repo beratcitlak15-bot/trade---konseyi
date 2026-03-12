@@ -1,33 +1,24 @@
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify
 import requests
 import os
+import time
+import threading
 from datetime import datetime
 
 app = Flask(__name__)
-
-# =========================
-# CONFIG
-# =========================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 WATCHLIST = [
     "EURUSD",
-    "GBPUSD",
     "XAUUSD",
-    "XAGUSD",
-    "OIL",
     "NASDAQ",
-    "SP500",
+    "US30",
+    "DXY"
 ]
 
-EURUSD_MODEL = "London Reversal"
-DEFAULT_MODEL = "ICT Intraday"
-
-# =========================
-# TELEGRAM MESSAGE
-# =========================
+SCAN_INTERVAL = 300  # 5 dakika
 
 def send_telegram_message(text):
 
@@ -39,147 +30,96 @@ def send_telegram_message(text):
     }
 
     try:
-        response = requests.post(url, json=payload, timeout=15)
-        return response.json()
+        requests.post(url, json=payload)
     except Exception as e:
-        return {"error": str(e)}
+        print("Telegram error:", e)
 
-# =========================
-# NEWS FILTER (placeholder)
-# =========================
+def get_session():
 
-def get_news_status(symbol):
+    utc_hour = datetime.utcnow().hour
 
-    return {
-        "status": "CLEAR",
-        "comment": "No high impact news next 60 minutes"
-    }
+    if 0 <= utc_hour < 7:
+        return "ASIA"
 
-# =========================
-# DXY FILTER (placeholder)
-# =========================
+    if 7 <= utc_hour < 13:
+        return "LONDON"
+
+    if 13 <= utc_hour < 21:
+        return "NEW YORK"
+
+    return "CLOSED"
 
 def get_dxy_bias():
 
-    return {
-        "bias": "NEUTRAL",
-        "comment": "DXY filter placeholder"
-    }
+    # placeholder
+    return "NEUTRAL"
 
-# =========================
-# QUALITY SCORE
-# =========================
+def analyze_symbol(symbol):
 
-def calculate_quality_score(symbol):
+    if symbol == "DXY":
+        return None
 
-    if symbol == "EURUSD":
-        return 7.5
-    else:
-        return 6.8
+    bias = get_dxy_bias()
 
-# =========================
-# BUILD MESSAGE
-# =========================
-
-def build_signal_message(symbol):
-
-    model = EURUSD_MODEL if symbol == "EURUSD" else DEFAULT_MODEL
-
-    news = get_news_status(symbol)
-    dxy = get_dxy_bias()
-    score = calculate_quality_score(symbol)
-
-    time_now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.utcnow().strftime("%H:%M")
 
     message = f"""
-AI TRADE SIGNAL
+Market Scan
 
 Pair: {symbol}
-Model: {model}
-Timeframe: M5 / M15
-Time: {time_now}
+Time: {now} UTC
 
-DXY Bias: {dxy['bias']}
-DXY Note: {dxy['comment']}
+DXY Bias: {bias}
 
-News Status: {news['status']}
-News Note: {news['comment']}
-
-Setup Score: {score}/10
-
-Watch for:
-- liquidity sweep
-- MSS
-- FVG retest
-- OB retest
+Status: Monitoring structure
+Waiting for ICT setup
 """
 
     return message
 
-# =========================
-# HOME
-# =========================
+def scan_markets():
+
+    while True:
+
+        session = get_session()
+
+        if session == "CLOSED":
+            time.sleep(600)
+            continue
+
+        print("Scanning markets...")
+
+        for symbol in WATCHLIST:
+
+            result = analyze_symbol(symbol)
+
+            if result:
+                send_telegram_message(result)
+
+        time.sleep(SCAN_INTERVAL)
 
 @app.route("/")
 def home():
 
     return jsonify({
-        "status": "trade agent running"
+        "status": "AI trade agent running"
     })
-
-# =========================
-# TEST TELEGRAM
-# =========================
 
 @app.route("/test")
 def test():
 
-    result = send_telegram_message("Trade agent online")
+    send_telegram_message("AI trading agent active")
 
-    return jsonify(result)
+    return jsonify({"status": "message sent"})
 
-# =========================
-# MANUAL SIGNAL
-# =========================
 
-@app.route("/signal", methods=["POST"])
-def signal():
+def start_scanner():
 
-    data = request.get_json()
+    scanner = threading.Thread(target=scan_markets)
+    scanner.daemon = True
+    scanner.start()
 
-    symbol = data.get("symbol", "EURUSD").upper()
-
-    if symbol not in WATCHLIST:
-        return jsonify({
-            "error": "symbol not supported"
-        })
-
-    message = build_signal_message(symbol)
-
-    result = send_telegram_message(message)
-
-    return jsonify(result)
-
-# =========================
-# WEBHOOK
-# =========================
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-
-    data = request.get_json()
-
-    symbol = data.get("symbol", "EURUSD").upper()
-
-    message = f"Webhook trigger received for {symbol}"
-
-    result = send_telegram_message(message)
-
-    return jsonify(result)
-
-# =========================
-# RUN SERVER
-# =========================
+start_scanner()
 
 if __name__ == "__main__":
 
