@@ -16,20 +16,11 @@ WATCHLIST = [
     "XAUUSD",
     "NASDAQ",
     "US30",
-    "DXY",
+    "DXY"
 ]
 
 SCAN_INTERVAL = 300  # 5 dakika
 LAST_SENT = {}
-
-# DXY için farklı aday semboller
-DXY_CANDIDATES = [
-    "DX-Y.NYB",
-    "DXY",
-    "USDX",
-    "DXY:INDEX",
-    "ICE.USDX",
-]
 
 
 def send_telegram_message(text: str):
@@ -38,6 +29,7 @@ def send_telegram_message(text: str):
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text
     }
+
     try:
         response = requests.post(url, json=payload, timeout=15)
         return response.json()
@@ -71,14 +63,23 @@ def get_model(symbol: str):
         return "ICT Intraday"
 
 
-def get_twelvedata_symbol(symbol: str):
-    mapping = {
-        "EURUSD": "EUR/USD",
-        "XAUUSD": "XAU/USD",
-        "NASDAQ": "NDX",
-        "US30": "DJI",
+def find_symbol_on_twelvedata(query: str):
+    url = "https://api.twelvedata.com/symbol_search"
+    params = {
+        "symbol": query,
+        "apikey": TWELVEDATA_API_KEY
     }
-    return mapping.get(symbol, symbol)
+
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+
+        if "data" in data and len(data["data"]) > 0:
+            return data["data"][0]["symbol"]
+
+        return None
+    except Exception:
+        return None
 
 
 def fetch_price_from_twelvedata(api_symbol: str):
@@ -101,14 +102,89 @@ def fetch_price_from_twelvedata(api_symbol: str):
 
 
 def get_price(symbol: str):
-    if symbol == "DXY":
-        for candidate in DXY_CANDIDATES:
-            price = fetch_price_from_twelvedata(candidate)
-            if price is not None:
-                return price
-        return None
+    """
+    Önce doğru sembolü bulmaya çalışır, sonra fiyatı çeker.
+    """
+    if symbol == "EURUSD":
+        api_symbol = "EUR/USD"
 
-    api_symbol = get_twelvedata_symbol(symbol)
+    elif symbol == "XAUUSD":
+        # Önce doğrudan dene, olmazsa arama yap
+        api_symbol = "XAU/USD"
+        price = fetch_price_from_twelvedata(api_symbol)
+        if price is not None:
+            return price
+
+        searched = find_symbol_on_twelvedata("XAU/USD")
+        if searched is None:
+            searched = find_symbol_on_twelvedata("gold")
+        if searched is None:
+            return None
+
+        api_symbol = searched
+
+    elif symbol == "NASDAQ":
+        # Önce NDX, olmazsa NASDAQ araması
+        api_symbol = "NDX"
+        price = fetch_price_from_twelvedata(api_symbol)
+        if price is not None:
+            return price
+
+        searched = find_symbol_on_twelvedata("NASDAQ")
+        if searched is None:
+            searched = find_symbol_on_twelvedata("NDX")
+        if searched is None:
+            return None
+
+        api_symbol = searched
+
+    elif symbol == "US30":
+        # Önce DJI, olmazsa DOW/US30 araması
+        api_symbol = "DJI"
+        price = fetch_price_from_twelvedata(api_symbol)
+        if price is not None:
+            return price
+
+        searched = find_symbol_on_twelvedata("DOW")
+        if searched is None:
+            searched = find_symbol_on_twelvedata("US30")
+        if searched is None:
+            searched = find_symbol_on_twelvedata("DJI")
+        if searched is None:
+            return None
+
+        api_symbol = searched
+
+    elif symbol == "DXY":
+        # DXY için birkaç arama dene
+        candidates = [
+            "DXY",
+            "USDX",
+            "DX-Y.NYB",
+            "dollar index",
+            "ice us dollar index"
+        ]
+
+        api_symbol = None
+
+        for candidate in candidates:
+            # önce direkt price endpoint
+            direct_price = fetch_price_from_twelvedata(candidate)
+            if direct_price is not None:
+                return direct_price
+
+            # sonra symbol search
+            found = find_symbol_on_twelvedata(candidate)
+            if found:
+                api_symbol = found
+                break
+
+        if api_symbol is None:
+            return None
+
+    else:
+        api_symbol = symbol
+
     return fetch_price_from_twelvedata(api_symbol)
 
 
@@ -121,20 +197,24 @@ def get_dxy_bias():
             "yorum": "DXY verisi alınamadı."
         }
 
-    # Geçici basit mantık
+    # Geçici basit yorum
     if dxy_price >= 100:
         return {
             "yon": "Yükseliş",
-            "yorum": f"DXY güçlü görünüyor. Anlık fiyat: {dxy_price}"
+            "yorum": f"Dolar güçlü görünüyor. Anlık DXY: {dxy_price}"
         }
     else:
         return {
             "yon": "Düşüş",
-            "yorum": f"DXY zayıf görünüyor. Anlık fiyat: {dxy_price}"
+            "yorum": f"Dolar zayıf görünüyor. Anlık DXY: {dxy_price}"
         }
 
 
 def get_news_risk(symbol: str):
+    """
+    Şimdilik placeholder.
+    İleride gerçek ekonomik takvim bağlanacak.
+    """
     return {
         "seviye": "Düşük",
         "mesaj": "Belirgin haber riski görünmüyor."
@@ -165,34 +245,90 @@ def generate_analysis(symbol: str, dxy_bias: dict):
         }
 
     if symbol == "EURUSD":
-        yon = "Düşüş" if dxy_bias["yon"] == "Yükseliş" else "Yükseliş" if dxy_bias["yon"] == "Düşüş" else "Nötr"
-        islem_yonu = "Short" if yon == "Düşüş" else "Long" if yon == "Yükseliş" else "Bekle"
+        yon = (
+            "Düşüş" if dxy_bias["yon"] == "Yükseliş"
+            else "Yükseliş" if dxy_bias["yon"] == "Düşüş"
+            else "Nötr"
+        )
+        islem_yonu = (
+            "Short" if yon == "Düşüş"
+            else "Long" if yon == "Yükseliş"
+            else "Bekle"
+        )
         zarar = round(price + 0.0015, 5) if islem_yonu == "Short" else round(price - 0.0015, 5)
         kar = round(price - 0.0030, 5) if islem_yonu == "Short" else round(price + 0.0030, 5)
 
+        likidite = "Asya bölgesi likiditesi izleniyor"
+        yapi = "MSS teyidi bekleniyor"
+        fvg = "FVG oluşumu takip ediliyor"
+        ob = "Order Block bölgesi yakın"
+
     elif symbol == "XAUUSD":
-        yon = "Düşüş" if dxy_bias["yon"] == "Yükseliş" else "Yükseliş" if dxy_bias["yon"] == "Düşüş" else "Nötr"
-        islem_yonu = "Short" if yon == "Düşüş" else "Long" if yon == "Yükseliş" else "Bekle"
+        yon = (
+            "Düşüş" if dxy_bias["yon"] == "Yükseliş"
+            else "Yükseliş" if dxy_bias["yon"] == "Düşüş"
+            else "Nötr"
+        )
+        islem_yonu = (
+            "Short" if yon == "Düşüş"
+            else "Long" if yon == "Yükseliş"
+            else "Bekle"
+        )
         zarar = round(price + 8, 2) if islem_yonu == "Short" else round(price - 8, 2)
         kar = round(price - 16, 2) if islem_yonu == "Short" else round(price + 16, 2)
 
+        likidite = "Yakın eşit tepe/dip bölgeleri takip ediliyor"
+        yapi = "BOS sonrası intraday teyit aranıyor"
+        fvg = "FVG bölgesi mevcut"
+        ob = "Order Block retest ihtimali var"
+
     elif symbol == "NASDAQ":
-        yon = "Düşüş" if dxy_bias["yon"] == "Yükseliş" else "Yükseliş" if dxy_bias["yon"] == "Düşüş" else "Nötr"
-        islem_yonu = "Short" if yon == "Düşüş" else "Long" if yon == "Yükseliş" else "Bekle"
+        yon = (
+            "Düşüş" if dxy_bias["yon"] == "Yükseliş"
+            else "Yükseliş" if dxy_bias["yon"] == "Düşüş"
+            else "Nötr"
+        )
+        islem_yonu = (
+            "Short" if yon == "Düşüş"
+            else "Long" if yon == "Yükseliş"
+            else "Bekle"
+        )
         zarar = round(price + 80, 2) if islem_yonu == "Short" else round(price - 80, 2)
         kar = round(price - 160, 2) if islem_yonu == "Short" else round(price + 160, 2)
 
+        likidite = "Önceki seansın likidite bölgeleri takip ediliyor"
+        yapi = "Intraday yapı değişimi izleniyor"
+        fvg = "FVG bölgesi korunuyor"
+        ob = "Order Block dönüş alanı mevcut"
+
     elif symbol == "US30":
-        yon = "Düşüş" if dxy_bias["yon"] == "Yükseliş" else "Yükseliş" if dxy_bias["yon"] == "Düşüş" else "Nötr"
-        islem_yonu = "Short" if yon == "Düşüş" else "Long" if yon == "Yükseliş" else "Bekle"
+        yon = (
+            "Düşüş" if dxy_bias["yon"] == "Yükseliş"
+            else "Yükseliş" if dxy_bias["yon"] == "Düşüş"
+            else "Nötr"
+        )
+        islem_yonu = (
+            "Short" if yon == "Düşüş"
+            else "Long" if yon == "Yükseliş"
+            else "Bekle"
+        )
         zarar = round(price + 150, 2) if islem_yonu == "Short" else round(price - 150, 2)
         kar = round(price - 300, 2) if islem_yonu == "Short" else round(price + 300, 2)
+
+        likidite = "Gün içi tepe/dip likiditesi takipte"
+        yapi = "M15 yapısı izleniyor"
+        fvg = "FVG henüz tam teyitli değil"
+        ob = "Order Block bölgesine yaklaşım var"
 
     else:
         yon = "Nötr"
         islem_yonu = "Bekle"
         zarar = "-"
         kar = "-"
+        likidite = "Veri yok"
+        yapi = "Veri yok"
+        fvg = "Veri yok"
+        ob = "Veri yok"
 
     return {
         "varlik": symbol,
@@ -200,10 +336,10 @@ def generate_analysis(symbol: str, dxy_bias: dict):
         "seans": session,
         "fiyat": price,
         "yon": yon,
-        "likidite": "Likidite bölgeleri takip ediliyor",
-        "yapi": "Yapı teyidi aranıyor",
-        "fvg": "FVG bölgesi izleniyor",
-        "ob": "Order Block bölgesi izleniyor",
+        "likidite": likidite,
+        "yapi": yapi,
+        "fvg": fvg,
+        "ob": ob,
         "islem_yonu": islem_yonu,
         "giris": price,
         "zarar_durdur": zarar,
@@ -290,11 +426,15 @@ def test():
     eurusd = get_price("EURUSD")
     xauusd = get_price("XAUUSD")
     dxy = get_price("DXY")
+    nasdaq = get_price("NASDAQ")
+    us30 = get_price("US30")
 
     text = (
         f"✅ Sistem testi başarılı\n\n"
         f"EURUSD: {eurusd}\n"
         f"XAUUSD: {xauusd}\n"
+        f"NASDAQ: {nasdaq}\n"
+        f"US30: {us30}\n"
         f"DXY: {dxy}"
     )
 
