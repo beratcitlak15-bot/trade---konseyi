@@ -4,6 +4,7 @@ import os
 import time
 import threading
 from datetime import datetime
+import requests
 
 app = Flask(__name__)
 
@@ -307,3 +308,15 @@ start_scanner()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+def get_price(symbol):
+    api_key = os.getenv("TWELVEDATA_API_KEY")
+
+    url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={api_key}"
+
+    try:
+        r = requests.get(url).json()
+        return float(r["price"])
+    except:
+        return None
+        price = get_price("EUR/USD")
+print("EURUSD:", price)
