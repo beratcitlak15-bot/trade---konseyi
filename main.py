@@ -16,11 +16,20 @@ WATCHLIST = [
     "XAUUSD",
     "NASDAQ",
     "US30",
-    "DXY"
+    "DXY",
 ]
 
 SCAN_INTERVAL = 300  # 5 dakika
 LAST_SENT = {}
+
+# DXY için farklı aday semboller
+DXY_CANDIDATES = [
+    "DX-Y.NYB",
+    "DXY",
+    "USDX",
+    "DXY:INDEX",
+    "ICE.USDX",
+]
 
 
 def send_telegram_message(text: str):
@@ -68,13 +77,11 @@ def get_twelvedata_symbol(symbol: str):
         "XAUUSD": "XAU/USD",
         "NASDAQ": "NDX",
         "US30": "DJI",
-        "DXY": "DXY"
     }
     return mapping.get(symbol, symbol)
 
 
-def get_price(symbol: str):
-    api_symbol = get_twelvedata_symbol(symbol)
+def fetch_price_from_twelvedata(api_symbol: str):
     url = "https://api.twelvedata.com/price"
     params = {
         "symbol": api_symbol,
@@ -82,8 +89,8 @@ def get_price(symbol: str):
     }
 
     try:
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
+        response = requests.get(url, params=params, timeout=15)
+        data = response.json()
 
         if "price" in data:
             return float(data["price"])
@@ -91,6 +98,18 @@ def get_price(symbol: str):
         return None
     except Exception:
         return None
+
+
+def get_price(symbol: str):
+    if symbol == "DXY":
+        for candidate in DXY_CANDIDATES:
+            price = fetch_price_from_twelvedata(candidate)
+            if price is not None:
+                return price
+        return None
+
+    api_symbol = get_twelvedata_symbol(symbol)
+    return fetch_price_from_twelvedata(api_symbol)
 
 
 def get_dxy_bias():
@@ -102,7 +121,7 @@ def get_dxy_bias():
             "yorum": "DXY verisi alınamadı."
         }
 
-    # Şimdilik basit yorum
+    # Geçici basit mantık
     if dxy_price >= 100:
         return {
             "yon": "Yükseliş",
