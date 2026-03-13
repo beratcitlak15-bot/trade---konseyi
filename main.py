@@ -1,32 +1,12 @@
 from flask import Flask, jsonify
 import requests
 import os
-import time
-import threading
-from datetime import datetime
 
 app = Flask(__name__)
 
-# =========================
-# ENV
-# =========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
-ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
-
-# =========================
-# SETTINGS
-# =========================
-SCAN_INTERVAL = 30  # 30 saniye
-WATCHLIST = ["EURUSD", "XAUUSD", "NASDAQ", "US30", "DXY"]
-
-# Alpha Vantage için aday semboller
-INDEX_CANDIDATES = {
-    "NASDAQ": ["^NDX", "^IXIC", "QQQ"],
-    "US30": ["^DJI", "DIA"],
-    "DXY": ["DX-Y.NYB", "UUP"]
-}
 
 # =========================
 # TELEGRAM
@@ -56,22 +36,53 @@ def send_telegram_message(text: str):
     return telegram_api("sendMessage", payload)
 
 # =========================
-# TWELVEDATA
+# TWELVEDATA HELPERS
 # =========================
-def fetch_twelvedata_price(symbol: str):
+def td_symbol_search(query: str):
+    if not TWELVEDATA_API_KEY:
+        return {"ok": False, "error": "TWELVEDATA_API_KEY eksik.", "results": []}
+
+    url = "https://api.twelvedata.com/symbol_search"
+    params = {
+        "symbol": query,
+        "apikey": TWELVEDATA_API_KEY
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=25)
+        data = response.json()
+
+        # API bazen direkt liste, bazen data objesi döndürebilir
+        if isinstance(data, list):
+            raw_results = data
+        else:
+            raw_results = data.get("data", data.get("results", []))
+
+        results = []
+        for item in raw_results[:15]:
+            results.append({
+                "symbol": item.get("symbol"),
+                "instrument_name": item.get("instrument_name"),
+                "exchange": item.get("exchange"),
+                "mic_code": item.get("mic_code"),
+                "country": item.get("country"),
+                "type": item.get("type"),
+                "currency": item.get("currency"),
+            })
+
+        return {"ok": True, "results": results}
+
+    except Exception as e:
+        return {"ok": False, "error": str(e), "results": []}
+
+
+def td_price(symbol: str):
     if not TWELVEDATA_API_KEY:
         return None
 
-    symbol_map = {
-        "EURUSD": "EUR/USD",
-        "XAUUSD": "XAU/USD"
-    }
-
-    real_symbol = symbol_map.get(symbol, symbol)
-
     url = "https://api.twelvedata.com/price"
     params = {
-        "symbol": real_symbol,
+        "symbol": symbol,
         "apikey": TWELVEDATA_API_KEY
     }
 
@@ -81,166 +92,81 @@ def fetch_twelvedata_price(symbol: str):
 
         if "price" in data:
             return float(data["price"])
+
         return None
     except Exception:
         return None
 
-# =========================
-# ALPHA VANTAGE
-# =========================
-def av_global_quote(symbol: str):
-    if not ALPHAVANTAGE_API_KEY:
-        return None
 
-    url = "https://www.alphavantage.co/query"
+def td_time_series(symbol: str, interval="5min", outputsize=5):
+    if not TWELVEDATA_API_KEY:
+        return {"ok": False, "error": "TWELVEDATA_API_KEY eksik.", "candles": []}
+
+    url = "https://api.twelvedata.com/time_series"
     params = {
-        "function": "GLOBAL_QUOTE",
         "symbol": symbol,
-        "apikey": ALPHAVANTAGE_API_KEY
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVEDATA_API_KEY
     }
 
     try:
         response = requests.get(url, params=params, timeout=25)
         data = response.json()
 
-        quote = data.get("Global Quote", {})
-        price = quote.get("05. price")
+        values = data.get("values", [])
+        candles = []
 
-        if price is not None and str(price).strip() != "":
-            return float(price)
+        for item in values:
+            try:
+                candles.append({
+                    "datetime": item["datetime"],
+                    "open": float(item["open"]),
+                    "high": float(item["high"]),
+                    "low": float(item["low"]),
+                    "close": float(item["close"]),
+                })
+            except Exception:
+                continue
 
-        return None
-    except Exception:
-        return None
-
-
-def av_symbol_search(query: str):
-    if not ALPHAVANTAGE_API_KEY:
-        return []
-
-    url = "https://www.alphavantage.co/query"
-    params = {
-        "function": "SYMBOL_SEARCH",
-        "keywords": query,
-        "apikey": ALPHAVANTAGE_API_KEY
-    }
-
-    try:
-        response = requests.get(url, params=params, timeout=25)
-        data = response.json()
-        matches = data.get("bestMatches", [])
-
-        results = []
-        for item in matches[:10]:
-            results.append({
-                "symbol": item.get("1. symbol"),
-                "name": item.get("2. name"),
-                "type": item.get("3. type"),
-                "region": item.get("4. region"),
-                "currency": item.get("8. currency")
-            })
-
-        return results
-    except Exception:
-        return []
+        return {"ok": True, "candles": candles}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "candles": []}
 
 # =========================
-# MARKET FETCHERS
+# REPORT BUILDERS
 # =========================
-def fetch_index_market(market_name: str):
-    candidates = INDEX_CANDIDATES.get(market_name, [])
-    tested = []
+def build_search_report(query: str, results: list):
+    lines = [f"🔎 Sembol arama sonucu: {query}", ""]
 
-    for sym in candidates:
-        price = av_global_quote(sym)
-        tested.append({
-            "symbol": sym,
-            "price": price
-        })
-        if price is not None:
-            return {
-                "market": market_name,
-                "symbol": sym,
-                "price": price,
-                "tested": tested
-            }
+    if not results:
+        lines.append("Sonuç bulunamadı.")
+        return "\n".join(lines)
 
-    return {
-        "market": market_name,
-        "symbol": None,
-        "price": None,
-        "tested": tested
-    }
-
-
-def fetch_market_price(market: str):
-    if market in ["EURUSD", "XAUUSD"]:
-        return {
-            "market": market,
-            "symbol": market,
-            "price": fetch_twelvedata_price(market)
-        }
-
-    if market in ["NASDAQ", "US30", "DXY"]:
-        return fetch_index_market(market)
-
-    return {
-        "market": market,
-        "symbol": None,
-        "price": None
-    }
-
-# =========================
-# ANALYSIS (şimdilik basit veri odaklı)
-# =========================
-def simple_bias(current_price, previous_price):
-    if current_price is None or previous_price is None:
-        return "Bilinmiyor"
-    if current_price > previous_price:
-        return "Yükseliş"
-    if current_price < previous_price:
-        return "Düşüş"
-    return "Nötr"
-
-# Önceki değerleri hafızada tut
-LAST_PRICES = {}
-
-def build_market_snapshot():
-    lines = ["📡 TRADE KONSEYİ VERİ RAPORU", ""]
-
-    for market in WATCHLIST:
-        info = fetch_market_price(market)
-        current_price = info.get("price")
-        previous_price = LAST_PRICES.get(market)
-        bias = simple_bias(current_price, previous_price)
-
-        if current_price is not None:
-            LAST_PRICES[market] = current_price
-
-        used_symbol = info.get("symbol") if info.get("symbol") else "-"
-        lines.append(f"{market}: {current_price}")
-        lines.append(f"Sembol: {used_symbol}")
-        lines.append(f"Kısa Yön: {bias}")
+    for i, item in enumerate(results[:10], start=1):
+        lines.append(f"{i}) {item.get('symbol')}")
+        lines.append(f"İsim: {item.get('instrument_name')}")
+        lines.append(f"Borsa: {item.get('exchange')}")
+        lines.append(f"Tür: {item.get('type')}")
+        lines.append(f"Ülke: {item.get('country')}")
         lines.append("")
 
-    lines.append(f"Zaman: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     return "\n".join(lines)
 
-# =========================
-# BACKGROUND SCANNER
-# =========================
-def scanner_loop():
-    while True:
-        try:
-            # Şimdilik otomatik mesaj atmıyor
-            # sadece sistem çalışsın ve hafızada fiyat tutsun
-            for market in WATCHLIST:
-                info = fetch_market_price(market)
-                if info.get("price") is not None:
-                    LAST_PRICES[market] = info["price"]
-            time.sleep(SCAN_INTERVAL)
-        except Exception:
-            time.sleep(SCAN_INTERVAL)
+
+def build_validate_report(symbol: str, price, candles_result):
+    lines = [f"🧪 Sembol doğrulama: {symbol}", ""]
+
+    lines.append(f"Fiyat: {price}")
+
+    if candles_result.get("ok") and candles_result.get("candles"):
+        lines.append(f"5dk mum verisi: VAR ({len(candles_result['candles'])} adet)")
+        last = candles_result["candles"][0]
+        lines.append(f"İlk mum zamanı: {last['datetime']}")
+    else:
+        lines.append("5dk mum verisi: YOK")
+
+    return "\n".join(lines)
 
 # =========================
 # ROUTES
@@ -249,125 +175,78 @@ def scanner_loop():
 def home():
     return jsonify({
         "ok": True,
-        "status": "Trade Konseyi veri motoru aktif",
-        "watchlist": WATCHLIST,
-        "scan_interval_seconds": SCAN_INTERVAL
+        "status": "Trade Konseyi sembol keşif motoru aktif"
     })
 
 
 @app.route("/test", methods=["GET"])
 def test():
-    eurusd = fetch_market_price("EURUSD")
-    xauusd = fetch_market_price("XAUUSD")
-    nasdaq = fetch_market_price("NASDAQ")
-    us30 = fetch_market_price("US30")
-    dxy = fetch_market_price("DXY")
-
     text = (
-        f"✅ Sistem testi başarılı\n\n"
-        f"EURUSD: {eurusd['price']}\n"
-        f"XAUUSD: {xauusd['price']}\n"
-        f"NASDAQ: {nasdaq['price']} ({nasdaq.get('symbol')})\n"
-        f"US30: {us30['price']} ({us30.get('symbol')})\n"
-        f"DXY: {dxy['price']} ({dxy.get('symbol')})"
+        "✅ Sembol keşif motoru aktif\n\n"
+        "Kullanılacak endpointler:\n"
+        "/search/nasdaq\n"
+        "/search/dow\n"
+        "/search/dollar\n"
+        "/search/us30\n"
+        "/search/dxy\n"
+        "/search/nq\n"
+        "/search/ym\n"
+        "/search/dx\n"
+        "/validate/SYMBOL"
     )
 
     result = send_telegram_message(text)
-    return jsonify({
-        "telegram_result": result,
-        "data": {
-            "EURUSD": eurusd,
-            "XAUUSD": xauusd,
-            "NASDAQ": nasdaq,
-            "US30": us30,
-            "DXY": dxy
-        }
-    })
+    return jsonify(result)
 
 
-@app.route("/test-all", methods=["GET"])
-def test_all():
-    text = build_market_snapshot()
-    result = send_telegram_message(text)
-    return jsonify({
-        "ok": True,
-        "telegram_result": result,
-        "snapshot": text
-    })
+@app.route("/search/<query>", methods=["GET"])
+def search_symbol(query):
+    result = td_symbol_search(query)
 
+    if not result["ok"]:
+        return jsonify(result), 500
 
-@app.route("/test-indices", methods=["GET"])
-def test_indices():
-    nasdaq = fetch_market_price("NASDAQ")
-    us30 = fetch_market_price("US30")
-    dxy = fetch_market_price("DXY")
+    report = build_search_report(query, result["results"])
+    telegram_result = send_telegram_message(report)
 
-    text = (
-        f"📈 İndeks veri testi\n\n"
-        f"NASDAQ: {nasdaq['price']} ({nasdaq.get('symbol')})\n"
-        f"US30: {us30['price']} ({us30.get('symbol')})\n"
-        f"DXY: {dxy['price']} ({dxy.get('symbol')})"
-    )
-
-    result = send_telegram_message(text)
-    return jsonify({
-        "ok": True,
-        "telegram_result": result,
-        "NASDAQ": nasdaq,
-        "US30": us30,
-        "DXY": dxy
-    })
-
-
-@app.route("/discover/<query>", methods=["GET"])
-def discover(query):
-    results = av_symbol_search(query)
     return jsonify({
         "ok": True,
         "query": query,
-        "results": results
+        "results": result["results"],
+        "telegram_result": telegram_result
     })
 
 
-@app.route("/manual/<market>", methods=["GET"])
-def manual_market(market):
-    market = market.upper()
-    if market not in WATCHLIST:
-        return jsonify({"ok": False, "error": "Geçersiz market"}), 400
+@app.route("/validate/<path:symbol>", methods=["GET"])
+def validate_symbol(symbol):
+    price = td_price(symbol)
+    candles_result = td_time_series(symbol, interval="5min", outputsize=5)
 
-    info = fetch_market_price(market)
-    prev = LAST_PRICES.get(market)
-    bias = simple_bias(info.get("price"), prev)
+    report = build_validate_report(symbol, price, candles_result)
+    telegram_result = send_telegram_message(report)
 
-    if info.get("price") is not None:
-        LAST_PRICES[market] = info["price"]
-
-    text = (
-        f"📋 Manuel veri sonucu\n\n"
-        f"Market: {market}\n"
-        f"Fiyat: {info.get('price')}\n"
-        f"Kullanılan sembol: {info.get('symbol')}\n"
-        f"Kısa yön: {bias}"
-    )
-
-    result = send_telegram_message(text)
     return jsonify({
         "ok": True,
-        "market": market,
-        "info": info,
-        "telegram_result": result
+        "symbol": symbol,
+        "price": price,
+        "candles_result": candles_result,
+        "telegram_result": telegram_result
     })
 
-# =========================
-# START
-# =========================
-def start_scanner():
-    t = threading.Thread(target=scanner_loop)
-    t.daemon = True
-    t.start()
 
+@app.route("/quick-discover", methods=["GET"])
+def quick_discover():
+    queries = ["nasdaq", "dow", "dxy", "dollar", "us30", "nq", "ym", "dx"]
+    output = {}
 
-start_scanner()
+    for q in queries:
+        result = td_symbol_search(q)
+        output[q] = result["results"][:5] if result["ok"] else []
+
+    return jsonify({
+        "ok": True,
+        "queries": output
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
