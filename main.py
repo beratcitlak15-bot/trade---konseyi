@@ -13,17 +13,16 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
-INDICES_API_KEY = os.getenv("INDICES_API_API_KEY")
+FMP_API_KEY = os.getenv("FMP_API_KEY")
 
 # =========================
-# AYARLAR
+# SETTINGS
 # =========================
 WATCHLIST = [
     "EURUSD",
     "XAUUSD",
     "NASDAQ",
-    "US30",
-    "DXY",
+    "US30"
 ]
 
 SCAN_INTERVAL = 300  # 5 dakika
@@ -52,7 +51,7 @@ def send_telegram_message(text: str):
         return {"ok": False, "error": str(e)}
 
 # =========================
-# SEANS
+# SESSION
 # =========================
 def get_session():
     utc_hour = datetime.utcnow().hour
@@ -74,10 +73,7 @@ def market_is_open():
 def get_model(symbol: str):
     if symbol == "EURUSD":
         return "London Reversal"
-    elif symbol == "DXY":
-        return "DXY Yön Filtresi"
-    else:
-        return "ICT Intraday"
+    return "ICT Intraday"
 
 # =========================
 # TWELVEDATA
@@ -104,60 +100,45 @@ def fetch_twelvedata_price(symbol: str):
         return None
 
 # =========================
-# INDICES API
+# FMP
 # =========================
-def fetch_indices_api_latest(symbols):
+def fetch_fmp_index_quote(symbol: str):
     """
-    symbols: ['NDX', 'DJI', 'DXY'] gibi liste
+    FMP stable index quote endpoint.
     """
-    if not INDICES_API_KEY:
-        return {}
+    if not FMP_API_KEY:
+        return None
 
-    joined_symbols = ",".join(symbols)
-
-    url = "https://indices-api.com/api/latest"
+    url = "https://financialmodelingprep.com/stable/index-quote"
     params = {
-        "access_key": INDICES_API_KEY,
-        "base": "USD",
-        "symbols": joined_symbols
+        "symbol": symbol,
+        "apikey": FMP_API_KEY
     }
 
     try:
         response = requests.get(url, params=params, timeout=20)
         data = response.json()
 
-        # Beklenen yapı:
-        # {
-        #   "success": true,
-        #   "base": "USD",
-        #   "rates": {
-        #       "NDX": ...,
-        #       "DJI": ...,
-        #       "DXY": ...
-        #   }
-        # }
-        rates = data.get("rates", {})
-        if isinstance(rates, dict):
-            return rates
+        # FMP bazen liste döndürebilir
+        if isinstance(data, list) and len(data) > 0:
+            item = data[0]
+            if isinstance(item, dict):
+                price = item.get("price")
+                if price is not None:
+                    return float(price)
 
-        return {}
-    except Exception:
-        return {}
+        # Bazen direkt obje dönebilir
+        if isinstance(data, dict):
+            price = data.get("price")
+            if price is not None:
+                return float(price)
 
-
-def fetch_single_index(symbol_code: str):
-    data = fetch_indices_api_latest([symbol_code])
-    value = data.get(symbol_code)
-
-    try:
-        if value is None:
-            return None
-        return float(value)
+        return None
     except Exception:
         return None
 
 # =========================
-# SEMBOL -> FİYAT
+# SYMBOL -> PRICE
 # =========================
 def resolve_symbol_and_price(symbol: str):
     if symbol == "EURUSD":
@@ -186,30 +167,36 @@ def resolve_symbol_and_price(symbol: str):
         }
 
     if symbol == "NASDAQ":
-        resolved_symbol = "NDX"
-        price = fetch_single_index(resolved_symbol)
+        # FMP tarafında gerçek endeks için Nasdaq 100'i hedefliyoruz
+        candidates = ["NDX", "^NDX", "^IXIC"]
+        for candidate in candidates:
+            price = fetch_fmp_index_quote(candidate)
+            if price is not None:
+                return {
+                    "requested": symbol,
+                    "resolved_symbol": candidate,
+                    "price": price
+                }
         return {
             "requested": symbol,
-            "resolved_symbol": resolved_symbol,
-            "price": price
+            "resolved_symbol": None,
+            "price": None
         }
 
     if symbol == "US30":
-        resolved_symbol = "DJI"
-        price = fetch_single_index(resolved_symbol)
+        candidates = ["DJI", "^DJI"]
+        for candidate in candidates:
+            price = fetch_fmp_index_quote(candidate)
+            if price is not None:
+                return {
+                    "requested": symbol,
+                    "resolved_symbol": candidate,
+                    "price": price
+                }
         return {
             "requested": symbol,
-            "resolved_symbol": resolved_symbol,
-            "price": price
-        }
-
-    if symbol == "DXY":
-        resolved_symbol = "DXY"
-        price = fetch_single_index(resolved_symbol)
-        return {
-            "requested": symbol,
-            "resolved_symbol": resolved_symbol,
-            "price": price
+            "resolved_symbol": None,
+            "price": None
         }
 
     return {
@@ -223,34 +210,17 @@ def get_price(symbol: str):
     return resolve_symbol_and_price(symbol)["price"]
 
 # =========================
-# DXY YÖN FİLTRESİ
+# DXY FILTER
 # =========================
 def get_dxy_bias():
-    dxy_info = resolve_symbol_and_price("DXY")
-    dxy_price = dxy_info["price"]
-
-    if dxy_price is None:
-        return {
-            "yon": "Nötr",
-            "yorum": "DXY verisi alınamadı.",
-            "fiyat": None
-        }
-
-    if dxy_price >= 100:
-        return {
-            "yon": "Yükseliş",
-            "yorum": f"Dolar güçlü görünüyor. Anlık DXY: {dxy_price}",
-            "fiyat": dxy_price
-        }
-    else:
-        return {
-            "yon": "Düşüş",
-            "yorum": f"Dolar zayıf görünüyor. Anlık DXY: {dxy_price}",
-            "fiyat": dxy_price
-        }
+    # Şimdilik kapalı
+    return {
+        "yon": "Nötr",
+        "yorum": "DXY filtresi geçici olarak devre dışı."
+    }
 
 # =========================
-# HABER RİSKİ
+# NEWS RISK
 # =========================
 def get_news_risk(symbol: str):
     return {
@@ -259,7 +229,7 @@ def get_news_risk(symbol: str):
     }
 
 # =========================
-# ANALİZ
+# ANALYSIS
 # =========================
 def generate_analysis(symbol: str, dxy_bias: dict):
     session = get_session()
@@ -286,19 +256,10 @@ def generate_analysis(symbol: str, dxy_bias: dict):
         }
 
     if symbol == "EURUSD":
-        yon = (
-            "Düşüş" if dxy_bias["yon"] == "Yükseliş"
-            else "Yükseliş" if dxy_bias["yon"] == "Düşüş"
-            else "Nötr"
-        )
-        islem_yonu = (
-            "Short" if yon == "Düşüş"
-            else "Long" if yon == "Yükseliş"
-            else "Bekle"
-        )
-        zarar = round(price + 0.0015, 5) if islem_yonu == "Short" else round(price - 0.0015, 5)
-        kar = round(price - 0.0030, 5) if islem_yonu == "Short" else round(price + 0.0030, 5)
-
+        yon = "Nötr"
+        islem_yonu = "Bekle"
+        zarar = "-"
+        kar = "-"
         likidite = "Asya bölgesi likiditesi izleniyor"
         yapi = "MSS teyidi bekleniyor"
         fvg = "FVG oluşumu takip ediliyor"
@@ -306,19 +267,10 @@ def generate_analysis(symbol: str, dxy_bias: dict):
         guven = 60
 
     elif symbol == "XAUUSD":
-        yon = (
-            "Düşüş" if dxy_bias["yon"] == "Yükseliş"
-            else "Yükseliş" if dxy_bias["yon"] == "Düşüş"
-            else "Nötr"
-        )
-        islem_yonu = (
-            "Short" if yon == "Düşüş"
-            else "Long" if yon == "Yükseliş"
-            else "Bekle"
-        )
-        zarar = round(price + 8, 2) if islem_yonu == "Short" else round(price - 8, 2)
-        kar = round(price - 16, 2) if islem_yonu == "Short" else round(price + 16, 2)
-
+        yon = "Nötr"
+        islem_yonu = "Bekle"
+        zarar = "-"
+        kar = "-"
         likidite = "Yakın eşit tepe/dip bölgeleri takip ediliyor"
         yapi = "BOS sonrası intraday teyit aranıyor"
         fvg = "FVG bölgesi mevcut"
@@ -330,8 +282,8 @@ def generate_analysis(symbol: str, dxy_bias: dict):
         islem_yonu = "Bekle"
         zarar = "-"
         kar = "-"
-        likidite = "Endeks verisi izleniyor"
-        yapi = "Doğrulama aşamasında"
+        likidite = "Endeks likidite bölgeleri izleniyor"
+        yapi = "Index yapı doğrulaması bekleniyor"
         fvg = "Henüz aktif değil"
         ob = "Henüz aktif değil"
         guven = 40
@@ -341,8 +293,8 @@ def generate_analysis(symbol: str, dxy_bias: dict):
         islem_yonu = "Bekle"
         zarar = "-"
         kar = "-"
-        likidite = "Endeks verisi izleniyor"
-        yapi = "Doğrulama aşamasında"
+        likidite = "Endeks likidite bölgeleri izleniyor"
+        yapi = "Index yapı doğrulaması bekleniyor"
         fvg = "Henüz aktif değil"
         ob = "Henüz aktif değil"
         guven = 40
@@ -376,7 +328,7 @@ def generate_analysis(symbol: str, dxy_bias: dict):
     }
 
 # =========================
-# SETUP FİLTRESİ
+# SIGNAL FILTER
 # =========================
 def setup_olustu_mu(analiz: dict, haber: dict):
     if analiz["seans"] == "Kapalı":
@@ -419,15 +371,11 @@ def signal_cache_guncelle(analiz: dict):
     LAST_SIGNAL_CACHE[key] = datetime.utcnow()
 
 # =========================
-# MESAJ
+# MESSAGE
 # =========================
 def build_single_report_message(symbol: str):
-    if symbol == "DXY":
-        return None, None, None
-
-    dxy = get_dxy_bias()
     haber = get_news_risk(symbol)
-    analiz = generate_analysis(symbol, dxy)
+    analiz = generate_analysis(symbol, get_dxy_bias())
     zaman = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     message = (
@@ -438,8 +386,8 @@ def build_single_report_message(symbol: str):
         f"Zaman: {zaman}\n"
         f"Anlık Fiyat: {analiz['fiyat']}\n\n"
         f"Yön: {analiz['yon']}\n"
-        f"DXY Durumu: {dxy['yon']}\n"
-        f"DXY Yorumu: {dxy['yorum']}\n"
+        f"DXY Durumu: Nötr\n"
+        f"DXY Yorumu: DXY filtresi geçici olarak devre dışı.\n"
         f"Likidite: {analiz['likidite']}\n"
         f"Yapı: {analiz['yapi']}\n"
         f"FVG: {analiz['fvg']}\n"
@@ -468,13 +416,7 @@ def scan_markets():
                 continue
 
             for symbol in WATCHLIST:
-                if symbol == "DXY":
-                    continue
-
                 message, analiz, haber = build_single_report_message(symbol)
-
-                if message is None:
-                    continue
 
                 if setup_olustu_mu(analiz, haber):
                     if not signal_cooldown_aktif_mi(analiz):
@@ -507,7 +449,6 @@ def test():
     xauusd = resolve_symbol_and_price("XAUUSD")
     nasdaq = resolve_symbol_and_price("NASDAQ")
     us30 = resolve_symbol_and_price("US30")
-    dxy = resolve_symbol_and_price("DXY")
 
     text = (
         f"✅ Sistem testi başarılı\n\n"
@@ -515,7 +456,7 @@ def test():
         f"XAUUSD: {xauusd['price']}\n"
         f"NASDAQ: {nasdaq['price']}\n"
         f"US30: {us30['price']}\n"
-        f"DXY: {dxy['price']}"
+        f"DXY: devre dışı"
     )
 
     result = send_telegram_message(text)
@@ -526,7 +467,7 @@ def test():
 def manual_symbol(symbol):
     symbol = symbol.upper()
 
-    if symbol not in WATCHLIST or symbol == "DXY":
+    if symbol not in WATCHLIST:
         return jsonify({
             "ok": False,
             "error": "Geçersiz sembol."
