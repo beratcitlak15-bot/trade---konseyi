@@ -1,3 +1,4 @@
+  
 from flask import Flask, jsonify
 import requests
 import os
@@ -23,23 +24,14 @@ WATCHLIST = [
 ]
 
 SCAN_INTERVAL = 300  # 5 dakika
-SIGNAL_COOLDOWN_MINUTES = 60
-TIMEFRAME = "5min"
-CANDLE_LIMIT = 20
+LTF_INTERVAL = "5min"
+HTF_INTERVAL = "1h"
+LTF_CANDLE_LIMIT = 120
+HTF_CANDLE_LIMIT = 120
+SIGNAL_COOLDOWN_MINUTES = 90
+MIN_SIGNAL_CONFIDENCE = 85
 
-# Aynı setup'ı tekrar tekrar göndermesin
 LAST_SIGNAL_CACHE = {}
-
-# Aktif sinyaller burada tutulur
-# Örnek:
-# ACTIVE_SIGNALS["EURUSD"] = {
-#   "direction": "LONG",
-#   "entry": 1.1450,
-#   "sl": 1.1435,
-#   "tp": 1.1480,
-#   "message_id": 123,
-#   "created_at": "..."
-# }
 ACTIVE_SIGNALS = {}
 
 # =========================
@@ -73,32 +65,7 @@ def send_telegram_message(text: str, reply_to_message_id=None):
     return telegram_api("sendMessage", payload)
 
 # =========================
-# TIME / SESSION
-# =========================
-def get_session():
-    utc_hour = datetime.utcnow().hour
-
-    if 0 <= utc_hour < 7:
-        return "Asya"
-    elif 7 <= utc_hour < 13:
-        return "Londra"
-    elif 13 <= utc_hour < 21:
-        return "New York"
-    else:
-        return "Kapalı"
-
-
-def market_is_open():
-    return get_session() != "Kapalı"
-
-
-def get_model(symbol: str):
-    if symbol == "EURUSD":
-        return "London Reversal"
-    return "ICT Intraday"
-
-# =========================
-# TWELVEDATA
+# SYMBOL MAP
 # =========================
 def symbol_map(symbol: str):
     mapping = {
@@ -107,7 +74,76 @@ def symbol_map(symbol: str):
     }
     return mapping.get(symbol, symbol)
 
+# =========================
+# SESSION / KILLZONE
+# =========================
+def get_session_info():
+    utc_hour = datetime.utcnow().hour
 
+    if 0 <= utc_hour < 7:
+        return {
+            "session": "Asya",
+            "killzone": False,
+            "trade_window": False
+        }
+    elif 7 <= utc_hour < 10:
+        return {
+            "session": "Londra Killzone",
+            "killzone": True,
+            "trade_window": True
+        }
+    elif 10 <= utc_hour < 13:
+        return {
+            "session": "Londra",
+            "killzone": False,
+            "trade_window": True
+        }
+    elif 13 <= utc_hour < 16:
+        return {
+            "session": "London-NY Overlap",
+            "killzone": True,
+            "trade_window": True
+        }
+    elif 16 <= utc_hour < 18:
+        return {
+            "session": "New York Killzone",
+            "killzone": True,
+            "trade_window": True
+        }
+    elif 18 <= utc_hour < 21:
+        return {
+            "session": "New York",
+            "killzone": False,
+            "trade_window": True
+        }
+    else:
+        return {
+            "session": "Kapalı",
+            "killzone": False,
+            "trade_window": False
+        }
+
+
+def get_session():
+    return get_session_info()["session"]
+
+
+def market_is_open():
+    return get_session_info()["session"] != "Kapalı"
+
+
+def in_trade_window():
+    return get_session_info()["trade_window"]
+
+
+def get_model(symbol: str):
+    if symbol == "EURUSD":
+        return "ICT London Reversal Engine"
+    return "ICT Intraday Engine"
+
+# =========================
+# TWELVEDATA
+# =========================
 def fetch_twelvedata_price(symbol: str):
     if not TWELVEDATA_API_KEY:
         return None
@@ -130,7 +166,7 @@ def fetch_twelvedata_price(symbol: str):
         return None
 
 
-def fetch_twelvedata_candles(symbol: str, interval: str = TIMEFRAME, outputsize: int = CANDLE_LIMIT):
+def fetch_twelvedata_candles(symbol: str, interval: str, outputsize: int):
     if not TWELVEDATA_API_KEY:
         return []
 
@@ -145,10 +181,7 @@ def fetch_twelvedata_candles(symbol: str, interval: str = TIMEFRAME, outputsize:
     try:
         response = requests.get(url, params=params, timeout=20)
         data = response.json()
-
         values = data.get("values", [])
-        if not values:
-            return []
 
         candles = []
         for item in values:
@@ -163,126 +196,418 @@ def fetch_twelvedata_candles(symbol: str, interval: str = TIMEFRAME, outputsize:
             except Exception:
                 continue
 
-        # Twelve Data genelde newest -> oldest döndürür
         candles.reverse()
         return candles
-
     except Exception:
         return []
 
 # =========================
-# ANALYSIS HELPERS
+# HELPERS
 # =========================
-def average_range(candles):
-    if not candles:
+def round_price(symbol, value):
+    if value is None:
         return None
+    return round(value, 5 if symbol == "EURUSD" else 2)
 
-    ranges = []
-    for c in candles[-10:]:
-        ranges.append(c["high"] - c["low"])
 
+def average_range(candles, lookback=14):
+    if len(candles) < lookback:
+        return None
+    ranges = [(c["high"] - c["low"]) for c in candles[-lookback:]]
     if not ranges:
         return None
-
     return sum(ranges) / len(ranges)
 
 
-def build_setup_from_candles(symbol: str, candles):
-    """
-    Bu tam ICT motoru değil.
-    Ama spam atmayan, muhafazakar bir setup filtresi.
-    Sonraki aşamada buna:
-    - liquidity sweep
-    - MSS
-    - FVG
-    - OB
-    eklenebilir.
-    """
+def candle_body(candle):
+    return abs(candle["close"] - candle["open"])
 
-    if len(candles) < 12:
+
+def is_bullish(candle):
+    return candle["close"] > candle["open"]
+
+
+def is_bearish(candle):
+    return candle["close"] < candle["open"]
+
+
+def recent_high(candles, lookback=20):
+    if len(candles) < lookback:
+        return None
+    subset = candles[-lookback:]
+    return max(c["high"] for c in subset)
+
+
+def recent_low(candles, lookback=20):
+    if len(candles) < lookback:
+        return None
+    subset = candles[-lookback:]
+    return min(c["low"] for c in subset)
+
+
+def find_swing_points(candles, left=2, right=2):
+    swing_highs = []
+    swing_lows = []
+
+    for i in range(left, len(candles) - right):
+        cur = candles[i]
+
+        left_highs = [candles[j]["high"] for j in range(i - left, i)]
+        right_highs = [candles[j]["high"] for j in range(i + 1, i + 1 + right)]
+        if cur["high"] > max(left_highs) and cur["high"] > max(right_highs):
+            swing_highs.append((i, cur["high"]))
+
+        left_lows = [candles[j]["low"] for j in range(i - left, i)]
+        right_lows = [candles[j]["low"] for j in range(i + 1, i + 1 + right)]
+        if cur["low"] < min(left_lows) and cur["low"] < min(right_lows):
+            swing_lows.append((i, cur["low"]))
+
+    return swing_highs, swing_lows
+
+
+def get_last_swing_high(candles):
+    highs, _ = find_swing_points(candles)
+    if not highs:
+        return None
+    return highs[-1]
+
+
+def get_last_swing_low(candles):
+    _, lows = find_swing_points(candles)
+    if not lows:
+        return None
+    return lows[-1]
+
+# =========================
+# ICT LOGIC
+# =========================
+def detect_htf_bias(htf_candles):
+    if len(htf_candles) < 30:
+        return "Nötr"
+
+    last = htf_candles[-1]["close"]
+    high_20 = recent_high(htf_candles[:-1], 20)
+    low_20 = recent_low(htf_candles[:-1], 20)
+
+    if high_20 is None or low_20 is None:
+        return "Nötr"
+
+    if last > high_20:
+        return "Yükseliş"
+
+    if last < low_20:
+        return "Düşüş"
+
+    # Basit trend yönü
+    last5 = [c["close"] for c in htf_candles[-5:]]
+    rising = all(last5[i] > last5[i - 1] for i in range(1, len(last5)))
+    falling = all(last5[i] < last5[i - 1] for i in range(1, len(last5)))
+
+    if rising:
+        return "Yükseliş"
+    if falling:
+        return "Düşüş"
+
+    return "Nötr"
+
+
+def detect_liquidity_sweep(ltf_candles, symbol):
+    if len(ltf_candles) < 30:
         return None
 
-    last = candles[-1]
-    c1 = candles[-2]
-    c2 = candles[-3]
-    c3 = candles[-4]
+    last = ltf_candles[-1]
+    prev = ltf_candles[:-1]
 
-    avg_r = average_range(candles)
-    if avg_r is None or avg_r <= 0:
+    last_high = get_last_swing_high(prev)
+    last_low = get_last_swing_low(prev)
+
+    if last_high:
+        _, swing_high_value = last_high
+        # yukarı likidite alınıp kapanış altında kaldıysa bearish sweep
+        if last["high"] > swing_high_value and last["close"] < swing_high_value:
+            return {
+                "type": "bearish",
+                "level": round_price(symbol, swing_high_value),
+                "text": f"Üst likidite sweep alındı ({round_price(symbol, swing_high_value)})"
+            }
+
+    if last_low:
+        _, swing_low_value = last_low
+        # aşağı likidite alınıp kapanış üstünde kaldıysa bullish sweep
+        if last["low"] < swing_low_value and last["close"] > swing_low_value:
+            return {
+                "type": "bullish",
+                "level": round_price(symbol, swing_low_value),
+                "text": f"Alt likidite sweep alındı ({round_price(symbol, swing_low_value)})"
+            }
+
+    return None
+
+
+def detect_mss(ltf_candles, symbol):
+    if len(ltf_candles) < 35:
         return None
 
-    current_price = last["close"]
-    session = get_session()
+    last = ltf_candles[-1]
+    prev = ltf_candles[:-1]
 
-    # LONG setup
-    bullish_structure = (
-        c3["close"] < c2["close"] < c1["close"] < last["close"]
-        and last["high"] > c1["high"]
-        and last["low"] > c1["low"]
-    )
+    swing_high = get_last_swing_high(prev)
+    swing_low = get_last_swing_low(prev)
 
-    # SHORT setup
-    bearish_structure = (
-        c3["close"] > c2["close"] > c1["close"] > last["close"]
-        and last["high"] < c1["high"]
-        and last["low"] < c1["low"]
-    )
-
-    if bullish_structure:
-        entry = round(current_price, 5 if symbol == "EURUSD" else 2)
-        sl_raw = current_price - (avg_r * 1.2)
-        tp_raw = current_price + (avg_r * 2.4)
-
-        sl = round(sl_raw, 5 if symbol == "EURUSD" else 2)
-        tp = round(tp_raw, 5 if symbol == "EURUSD" else 2)
-
+    if swing_high and last["close"] > swing_high[1]:
         return {
-            "symbol": symbol,
-            "session": session,
-            "direction": "LONG",
-            "bias": "Yükseliş",
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "confidence": 86,
-            "liquidity": "Yakın dip likiditesi sonrası yukarı devam ihtimali",
-            "structure": "Kısa vadeli yükseliş yapısı korunuyor",
-            "fvg": "Mikro dengesizlik bölgesi izleniyor",
-            "ob": "Yakın talep alanı korunuyor"
+            "type": "bullish",
+            "level": round_price(symbol, swing_high[1]),
+            "text": f"Bullish MSS / yapı kırılımı ({round_price(symbol, swing_high[1])})"
         }
 
-    if bearish_structure:
-        entry = round(current_price, 5 if symbol == "EURUSD" else 2)
-        sl_raw = current_price + (avg_r * 1.2)
-        tp_raw = current_price - (avg_r * 2.4)
-
-        sl = round(sl_raw, 5 if symbol == "EURUSD" else 2)
-        tp = round(tp_raw, 5 if symbol == "EURUSD" else 2)
-
+    if swing_low and last["close"] < swing_low[1]:
         return {
-            "symbol": symbol,
-            "session": session,
-            "direction": "SHORT",
-            "bias": "Düşüş",
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "confidence": 86,
-            "liquidity": "Yakın tepe likiditesi sonrası aşağı devam ihtimali",
-            "structure": "Kısa vadeli düşüş yapısı korunuyor",
-            "fvg": "Mikro dengesizlik bölgesi izleniyor",
-            "ob": "Yakın arz alanı korunuyor"
+            "type": "bearish",
+            "level": round_price(symbol, swing_low[1]),
+            "text": f"Bearish MSS / yapı kırılımı ({round_price(symbol, swing_low[1])})"
         }
 
     return None
 
 
-def signal_cache_key(setup: dict):
-    return f"{setup['symbol']}|{setup['direction']}|{setup['entry']}|{setup['sl']}|{setup['tp']}"
+def detect_fvg(ltf_candles, symbol):
+    if len(ltf_candles) < 3:
+        return None
+
+    a = ltf_candles[-3]
+    c = ltf_candles[-1]
+
+    if a["high"] < c["low"]:
+        return {
+            "type": "bullish",
+            "low": round_price(symbol, a["high"]),
+            "high": round_price(symbol, c["low"]),
+            "text": f"Bullish FVG mevcut ({round_price(symbol, a['high'])} - {round_price(symbol, c['low'])})"
+        }
+
+    if a["low"] > c["high"]:
+        return {
+            "type": "bearish",
+            "low": round_price(symbol, c["high"]),
+            "high": round_price(symbol, a["low"]),
+            "text": f"Bearish FVG mevcut ({round_price(symbol, c['high'])} - {round_price(symbol, a['low'])})"
+        }
+
+    return None
 
 
-def signal_cooldown_active(setup: dict):
-    key = signal_cache_key(setup)
+def detect_displacement(ltf_candles):
+    if len(ltf_candles) < 15:
+        return None
+
+    last = ltf_candles[-1]
+    avg_r = average_range(ltf_candles[:-1], 12)
+    if avg_r is None:
+        return None
+
+    last_range = last["high"] - last["low"]
+    last_body = candle_body(last)
+
+    active = last_range >= avg_r * 1.5 and last_body >= avg_r * 0.8
+
+    return {
+        "active": active,
+        "range": last_range,
+        "avg_range": avg_r
+    }
+
+
+def detect_premium_discount(ltf_candles, symbol):
+    if len(ltf_candles) < 30:
+        return None
+
+    dealing_high = recent_high(ltf_candles, 30)
+    dealing_low = recent_low(ltf_candles, 30)
+    current = ltf_candles[-1]["close"]
+
+    if dealing_high is None or dealing_low is None:
+        return None
+
+    eq = (dealing_high + dealing_low) / 2
+
+    zone = "discount" if current < eq else "premium"
+
+    return {
+        "zone": zone,
+        "high": round_price(symbol, dealing_high),
+        "low": round_price(symbol, dealing_low),
+        "equilibrium": round_price(symbol, eq),
+        "text": (
+            f"Discount bölgesinde" if zone == "discount"
+            else f"Premium bölgesinde"
+        )
+    }
+
+
+def detect_true_order_block(ltf_candles, direction, symbol):
+    """
+    Basit true OB yaklaşımı:
+    LONG için MSS öncesindeki son bearish mum
+    SHORT için MSS öncesindeki son bullish mum
+    """
+    if len(ltf_candles) < 20:
+        return None
+
+    search_zone = ltf_candles[-12:-1]
+    if not search_zone:
+        return None
+
+    if direction == "LONG":
+        for c in reversed(search_zone):
+            if is_bearish(c):
+                ob_low = min(c["open"], c["close"], c["low"])
+                ob_high = max(c["open"], c["close"], c["high"])
+                return {
+                    "type": "bullish",
+                    "low": round_price(symbol, ob_low),
+                    "high": round_price(symbol, ob_high),
+                    "text": f"Bullish OB alanı ({round_price(symbol, ob_low)} - {round_price(symbol, ob_high)})"
+                }
+
+    if direction == "SHORT":
+        for c in reversed(search_zone):
+            if is_bullish(c):
+                ob_low = min(c["open"], c["close"], c["low"])
+                ob_high = max(c["open"], c["close"], c["high"])
+                return {
+                    "type": "bearish",
+                    "low": round_price(symbol, ob_low),
+                    "high": round_price(symbol, ob_high),
+                    "text": f"Bearish OB alanı ({round_price(symbol, ob_low)} - {round_price(symbol, ob_high)})"
+                }
+
+    return None
+
+# =========================
+# ANALYSIS ENGINE
+# =========================
+def analyze_market(symbol: str):
+    ltf_candles = fetch_twelvedata_candles(symbol, LTF_INTERVAL, LTF_CANDLE_LIMIT)
+    htf_candles = fetch_twelvedata_candles(symbol, HTF_INTERVAL, HTF_CANDLE_LIMIT)
+
+    if len(ltf_candles) < 40 or len(htf_candles) < 40:
+        return None
+
+    session_info = get_session_info()
+    current_price = fetch_twelvedata_price(symbol)
+    if current_price is None:
+        return None
+
+    current_price = round_price(symbol, current_price)
+
+    htf_bias = detect_htf_bias(htf_candles)
+    sweep = detect_liquidity_sweep(ltf_candles, symbol)
+    mss = detect_mss(ltf_candles, symbol)
+    fvg = detect_fvg(ltf_candles, symbol)
+    displacement = detect_displacement(ltf_candles)
+    pd = detect_premium_discount(ltf_candles, symbol)
+
+    direction = "Bekle"
+    confidence = 40
+    analysis_notes = []
+
+    if sweep:
+        analysis_notes.append(sweep["text"])
+    if mss:
+        analysis_notes.append(mss["text"])
+    if fvg:
+        analysis_notes.append(fvg["text"])
+    if displacement and displacement["active"]:
+        analysis_notes.append("Displacement güçlü")
+    if pd:
+        analysis_notes.append(pd["text"])
+
+    # LONG SETUP
+    if (
+        session_info["trade_window"]
+        and sweep
+        and sweep["type"] == "bullish"
+        and mss
+        and mss["type"] == "bullish"
+        and htf_bias == "Yükseliş"
+        and displacement
+        and displacement["active"] is True
+        and pd
+        and pd["zone"] == "discount"
+        and (fvg is None or fvg["type"] == "bullish")
+    ):
+        direction = "LONG"
+        confidence = 90
+
+    # SHORT SETUP
+    elif (
+        session_info["trade_window"]
+        and sweep
+        and sweep["type"] == "bearish"
+        and mss
+        and mss["type"] == "bearish"
+        and htf_bias == "Düşüş"
+        and displacement
+        and displacement["active"] is True
+        and pd
+        and pd["zone"] == "premium"
+        and (fvg is None or fvg["type"] == "bearish")
+    ):
+        direction = "SHORT"
+        confidence = 90
+
+    ob = detect_true_order_block(ltf_candles, direction if direction != "Bekle" else "LONG", symbol)
+    if direction == "SHORT":
+        ob = detect_true_order_block(ltf_candles, "SHORT", symbol)
+
+    avg_r = average_range(ltf_candles, 14)
+    if avg_r is None:
+        return None
+
+    entry = current_price
+    sl = "-"
+    tp = "-"
+
+    if direction == "LONG":
+        sl = round_price(symbol, current_price - avg_r * 1.3)
+        tp = round_price(symbol, current_price + avg_r * 2.6)
+
+    elif direction == "SHORT":
+        sl = round_price(symbol, current_price + avg_r * 1.3)
+        tp = round_price(symbol, current_price - avg_r * 2.6)
+
+    return {
+        "symbol": symbol,
+        "model": get_model(symbol),
+        "session": session_info["session"],
+        "killzone": session_info["killzone"],
+        "trade_window": session_info["trade_window"],
+        "current_price": current_price,
+        "htf_bias": htf_bias,
+        "liquidity": sweep["text"] if sweep else "Net liquidity sweep yok",
+        "structure": mss["text"] if mss else "Net MSS yok",
+        "fvg": fvg["text"] if fvg else "Belirgin FVG yok",
+        "displacement": "Güçlü" if (displacement and displacement["active"]) else "Zayıf",
+        "premium_discount": pd["text"] if pd else "PD alanı belirsiz",
+        "order_block": ob["text"] if ob else "True order block net değil",
+        "direction": direction,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "confidence": confidence,
+        "notes": analysis_notes
+    }
+
+# =========================
+# SIGNAL CACHE
+# =========================
+def signal_cache_key(analysis: dict):
+    return f"{analysis['symbol']}|{analysis['direction']}|{analysis['entry']}|{analysis['sl']}|{analysis['tp']}"
+
+
+def signal_cooldown_active(analysis: dict):
+    key = signal_cache_key(analysis)
     last_time = LAST_SIGNAL_CACHE.get(key)
 
     if last_time is None:
@@ -291,42 +616,59 @@ def signal_cooldown_active(setup: dict):
     return (datetime.utcnow() - last_time) < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
 
 
-def update_signal_cache(setup: dict):
-    key = signal_cache_key(setup)
-    LAST_SIGNAL_CACHE[key] = datetime.utcnow()
+def update_signal_cache(analysis: dict):
+    LAST_SIGNAL_CACHE[signal_cache_key(analysis)] = datetime.utcnow()
 
 # =========================
-# MESSAGE BUILDERS
+# MESSAGES
 # =========================
-def build_signal_message(symbol: str, setup: dict, current_price: float):
+def build_signal_message(analysis: dict):
     zaman = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    model = get_model(symbol)
+    kz_text = "Evet" if analysis["killzone"] else "Hayır"
 
-    message = (
+    return (
         f"📊 ANALİZ + SİNYAL RAPORU\n\n"
-        f"Varlık: {symbol}\n"
-        f"Model: {model}\n"
-        f"Seans: {setup['session']}\n"
+        f"Varlık: {analysis['symbol']}\n"
+        f"Model: {analysis['model']}\n"
+        f"Seans: {analysis['session']}\n"
+        f"Killzone: {kz_text}\n"
         f"Zaman: {zaman}\n"
-        f"Anlık Fiyat: {current_price}\n\n"
-        f"Yön: {setup['bias']}\n"
-        f"DXY Durumu: Nötr\n"
-        f"DXY Yorumu: DXY filtresi geçici olarak devre dışı.\n"
-        f"Likidite: {setup['liquidity']}\n"
-        f"Yapı: {setup['structure']}\n"
-        f"FVG: {setup['fvg']}\n"
-        f"Order Block: {setup['ob']}\n\n"
+        f"Anlık Fiyat: {analysis['current_price']}\n\n"
+        f"HTF Bias: {analysis['htf_bias']}\n"
+        f"Likidite Sweep: {analysis['liquidity']}\n"
+        f"MSS / Yapı: {analysis['structure']}\n"
+        f"FVG: {analysis['fvg']}\n"
+        f"Displacement: {analysis['displacement']}\n"
+        f"Premium / Discount: {analysis['premium_discount']}\n"
+        f"True Order Block: {analysis['order_block']}\n\n"
         f"📍 İşlem Planı\n"
-        f"İşlem Yönü: {setup['direction']}\n"
-        f"Giriş: {setup['entry']}\n"
-        f"Zarar Durdur: {setup['sl']}\n"
-        f"Kar Al: {setup['tp']}\n"
-        f"Güven Skoru: {setup['confidence']}/100\n\n"
+        f"İşlem Yönü: {analysis['direction']}\n"
+        f"Giriş: {analysis['entry']}\n"
+        f"Zarar Durdur: {analysis['sl']}\n"
+        f"Kar Al: {analysis['tp']}\n"
+        f"Güven Skoru: {analysis['confidence']}/100\n\n"
         f"⚠️ Risk Uyarısı\n"
         f"Haber Riski: Düşük\n"
-        f"Not: Bu sinyal otomatik tarama sonucu üretildi. İşleme girmeden önce kendi teyidini al."
+        f"Not: Bu sinyal otomatik ICT mantığıyla üretilmiştir. İşleme girmeden önce son teyidini al."
     )
-    return message
+
+
+def build_no_setup_message(analysis: dict):
+    return (
+        f"📋 Manuel analiz sonucu\n\n"
+        f"Varlık: {analysis['symbol']}\n"
+        f"Seans: {analysis['session']}\n"
+        f"Anlık Fiyat: {analysis['current_price']}\n"
+        f"HTF Bias: {analysis['htf_bias']}\n"
+        f"Likidite Sweep: {analysis['liquidity']}\n"
+        f"MSS / Yapı: {analysis['structure']}\n"
+        f"FVG: {analysis['fvg']}\n"
+        f"Displacement: {analysis['displacement']}\n"
+        f"Premium / Discount: {analysis['premium_discount']}\n"
+        f"True Order Block: {analysis['order_block']}\n"
+        f"Durum: Şu an net setup yok.\n"
+        f"Not: Bot sessiz kalır."
+    )
 
 
 def build_tp_message(signal: dict, current_price: float):
@@ -351,16 +693,17 @@ def build_sl_message(signal: dict, current_price: float):
     )
 
 # =========================
-# ACTIVE SIGNAL CHECK
+# TP / SL TRACKER
 # =========================
 def check_active_signals():
     symbols_to_remove = []
 
     for symbol, signal in ACTIVE_SIGNALS.items():
         current_price = fetch_twelvedata_price(symbol)
-
         if current_price is None:
             continue
+
+        current_price = round_price(symbol, current_price)
 
         if signal["direction"] == "LONG":
             if current_price >= signal["tp"]:
@@ -399,7 +742,6 @@ def check_active_signals():
 def scan_markets():
     while True:
         try:
-            # Önce aktif sinyalleri kontrol et
             check_active_signals()
 
             if not market_is_open():
@@ -407,26 +749,23 @@ def scan_markets():
                 continue
 
             for symbol in WATCHLIST:
-                # Aynı varlıkta aktif sinyal varsa yeni sinyal üretme
                 if symbol in ACTIVE_SIGNALS:
                     continue
 
-                candles = fetch_twelvedata_candles(symbol)
-                if not candles:
+                analysis = analyze_market(symbol)
+                if not analysis:
                     continue
 
-                setup = build_setup_from_candles(symbol, candles)
-                if setup is None:
+                if analysis["direction"] == "Bekle":
                     continue
 
-                if signal_cooldown_active(setup):
+                if analysis["confidence"] < MIN_SIGNAL_CONFIDENCE:
                     continue
 
-                current_price = fetch_twelvedata_price(symbol)
-                if current_price is None:
+                if signal_cooldown_active(analysis):
                     continue
 
-                message = build_signal_message(symbol, setup, current_price)
+                message = build_signal_message(analysis)
                 result = send_telegram_message(message)
 
                 if result.get("ok") is True:
@@ -434,15 +773,15 @@ def scan_markets():
 
                     ACTIVE_SIGNALS[symbol] = {
                         "symbol": symbol,
-                        "direction": setup["direction"],
-                        "entry": setup["entry"],
-                        "sl": setup["sl"],
-                        "tp": setup["tp"],
+                        "direction": analysis["direction"],
+                        "entry": analysis["entry"],
+                        "sl": analysis["sl"],
+                        "tp": analysis["tp"],
                         "message_id": message_id,
                         "created_at": datetime.utcnow().isoformat()
                     }
 
-                    update_signal_cache(setup)
+                    update_signal_cache(analysis)
 
             time.sleep(SCAN_INTERVAL)
 
@@ -460,7 +799,7 @@ def home():
         "session": get_session(),
         "watchlist": WATCHLIST,
         "scan_interval_seconds": SCAN_INTERVAL,
-        "mode": "Sadece setup olursa sinyal gönderir"
+        "mode": "Sadece güçlü ICT setup olursa sinyal gönderir"
     })
 
 
@@ -492,35 +831,18 @@ def manual_symbol(symbol):
             "error": "Geçersiz sembol."
         }), 400
 
-    candles = fetch_twelvedata_candles(symbol)
-    if not candles:
+    analysis = analyze_market(symbol)
+    if not analysis:
         return jsonify({
             "ok": False,
-            "error": "Mum verisi alınamadı."
+            "error": "Analiz üretilemedi."
         }), 500
 
-    setup = build_setup_from_candles(symbol, candles)
-    current_price = fetch_twelvedata_price(symbol)
-
-    if current_price is None:
-        return jsonify({
-            "ok": False,
-            "error": "Anlık fiyat alınamadı."
-        }), 500
-
-    if setup is None:
-        text = (
-            f"📋 Manuel analiz sonucu\n\n"
-            f"Varlık: {symbol}\n"
-            f"Seans: {get_session()}\n"
-            f"Anlık Fiyat: {current_price}\n"
-            f"Durum: Şu an net setup yok.\n"
-            f"Not: Bot sessiz kalır."
-        )
-        result = send_telegram_message(text)
+    if analysis["direction"] == "Bekle":
+        result = send_telegram_message(build_no_setup_message(analysis))
         return jsonify(result)
 
-    message = build_signal_message(symbol, setup, current_price)
+    message = build_signal_message(analysis)
     result = send_telegram_message(message)
 
     if result.get("ok") is True:
@@ -528,15 +850,15 @@ def manual_symbol(symbol):
 
         ACTIVE_SIGNALS[symbol] = {
             "symbol": symbol,
-            "direction": setup["direction"],
-            "entry": setup["entry"],
-            "sl": setup["sl"],
-            "tp": setup["tp"],
+            "direction": analysis["direction"],
+            "entry": analysis["entry"],
+            "sl": analysis["sl"],
+            "tp": analysis["tp"],
             "message_id": message_id,
             "created_at": datetime.utcnow().isoformat()
         }
 
-        update_signal_cache(setup)
+        update_signal_cache(analysis)
 
     return jsonify(result)
 
