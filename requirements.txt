@@ -1,2 +1,4 @@
 flask
 requests
+pandas
+git+https://github.com/rongardF/tvdatafeed.git
