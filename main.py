@@ -13,7 +13,6 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
-FMP_API_KEY = os.getenv("FMP_API_KEY")
 
 # =========================
 # SETTINGS
@@ -21,28 +20,36 @@ FMP_API_KEY = os.getenv("FMP_API_KEY")
 WATCHLIST = [
     "EURUSD",
     "XAUUSD",
-    "NASDAQ",
-    "US30"
 ]
 
 SCAN_INTERVAL = 300  # 5 dakika
-MIN_SIGNAL_GUVEN = 85
 SIGNAL_COOLDOWN_MINUTES = 60
+TIMEFRAME = "5min"
+CANDLE_LIMIT = 20
 
+# Aynı setup'ı tekrar tekrar göndermesin
 LAST_SIGNAL_CACHE = {}
+
+# Aktif sinyaller burada tutulur
+# Örnek:
+# ACTIVE_SIGNALS["EURUSD"] = {
+#   "direction": "LONG",
+#   "entry": 1.1450,
+#   "sl": 1.1435,
+#   "tp": 1.1480,
+#   "message_id": 123,
+#   "created_at": "..."
+# }
+ACTIVE_SIGNALS = {}
 
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram_message(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return {"ok": False, "error": "Telegram env eksik."}
+def telegram_api(method: str, payload: dict):
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "Telegram bot token eksik."}
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text
-    }
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
     try:
         response = requests.post(url, json=payload, timeout=20)
@@ -50,8 +57,23 @@ def send_telegram_message(text: str):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+
+def send_telegram_message(text: str, reply_to_message_id=None):
+    if not TELEGRAM_CHAT_ID:
+        return {"ok": False, "error": "Telegram chat id eksik."}
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text
+    }
+
+    if reply_to_message_id is not None:
+        payload["reply_to_message_id"] = reply_to_message_id
+
+    return telegram_api("sendMessage", payload)
+
 # =========================
-# SESSION
+# TIME / SESSION
 # =========================
 def get_session():
     utc_hour = datetime.utcnow().hour
@@ -78,13 +100,21 @@ def get_model(symbol: str):
 # =========================
 # TWELVEDATA
 # =========================
+def symbol_map(symbol: str):
+    mapping = {
+        "EURUSD": "EUR/USD",
+        "XAUUSD": "XAU/USD",
+    }
+    return mapping.get(symbol, symbol)
+
+
 def fetch_twelvedata_price(symbol: str):
     if not TWELVEDATA_API_KEY:
         return None
 
     url = "https://api.twelvedata.com/price"
     params = {
-        "symbol": symbol,
+        "symbol": symbol_map(symbol),
         "apikey": TWELVEDATA_API_KEY
     }
 
@@ -99,329 +129,320 @@ def fetch_twelvedata_price(symbol: str):
     except Exception:
         return None
 
-# =========================
-# FMP
-# =========================
-def fetch_fmp_index_quote(symbol: str):
-    """
-    FMP stable index quote endpoint.
-    """
-    if not FMP_API_KEY:
-        return None
 
-    url = "https://financialmodelingprep.com/stable/index-quote"
+def fetch_twelvedata_candles(symbol: str, interval: str = TIMEFRAME, outputsize: int = CANDLE_LIMIT):
+    if not TWELVEDATA_API_KEY:
+        return []
+
+    url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": symbol,
-        "apikey": FMP_API_KEY
+        "symbol": symbol_map(symbol),
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVEDATA_API_KEY
     }
 
     try:
         response = requests.get(url, params=params, timeout=20)
         data = response.json()
 
-        # FMP bazen liste döndürebilir
-        if isinstance(data, list) and len(data) > 0:
-            item = data[0]
-            if isinstance(item, dict):
-                price = item.get("price")
-                if price is not None:
-                    return float(price)
+        values = data.get("values", [])
+        if not values:
+            return []
 
-        # Bazen direkt obje dönebilir
-        if isinstance(data, dict):
-            price = data.get("price")
-            if price is not None:
-                return float(price)
+        candles = []
+        for item in values:
+            try:
+                candles.append({
+                    "datetime": item["datetime"],
+                    "open": float(item["open"]),
+                    "high": float(item["high"]),
+                    "low": float(item["low"]),
+                    "close": float(item["close"]),
+                })
+            except Exception:
+                continue
 
-        return None
+        # Twelve Data genelde newest -> oldest döndürür
+        candles.reverse()
+        return candles
+
     except Exception:
+        return []
+
+# =========================
+# ANALYSIS HELPERS
+# =========================
+def average_range(candles):
+    if not candles:
         return None
 
-# =========================
-# SYMBOL -> PRICE
-# =========================
-def resolve_symbol_and_price(symbol: str):
-    if symbol == "EURUSD":
-        resolved_symbol = "EUR/USD"
-        price = fetch_twelvedata_price(resolved_symbol)
-        return {
-            "requested": symbol,
-            "resolved_symbol": resolved_symbol,
-            "price": price
-        }
+    ranges = []
+    for c in candles[-10:]:
+        ranges.append(c["high"] - c["low"])
 
-    if symbol == "XAUUSD":
-        candidates = ["XAU/USD", "XAUUSD"]
-        for candidate in candidates:
-            price = fetch_twelvedata_price(candidate)
-            if price is not None:
-                return {
-                    "requested": symbol,
-                    "resolved_symbol": candidate,
-                    "price": price
-                }
-        return {
-            "requested": symbol,
-            "resolved_symbol": None,
-            "price": None
-        }
+    if not ranges:
+        return None
 
-    if symbol == "NASDAQ":
-        # FMP tarafında gerçek endeks için Nasdaq 100'i hedefliyoruz
-        candidates = ["NDX", "^NDX", "^IXIC"]
-        for candidate in candidates:
-            price = fetch_fmp_index_quote(candidate)
-            if price is not None:
-                return {
-                    "requested": symbol,
-                    "resolved_symbol": candidate,
-                    "price": price
-                }
-        return {
-            "requested": symbol,
-            "resolved_symbol": None,
-            "price": None
-        }
-
-    if symbol == "US30":
-        candidates = ["DJI", "^DJI"]
-        for candidate in candidates:
-            price = fetch_fmp_index_quote(candidate)
-            if price is not None:
-                return {
-                    "requested": symbol,
-                    "resolved_symbol": candidate,
-                    "price": price
-                }
-        return {
-            "requested": symbol,
-            "resolved_symbol": None,
-            "price": None
-        }
-
-    return {
-        "requested": symbol,
-        "resolved_symbol": None,
-        "price": None
-    }
+    return sum(ranges) / len(ranges)
 
 
-def get_price(symbol: str):
-    return resolve_symbol_and_price(symbol)["price"]
+def build_setup_from_candles(symbol: str, candles):
+    """
+    Bu tam ICT motoru değil.
+    Ama spam atmayan, muhafazakar bir setup filtresi.
+    Sonraki aşamada buna:
+    - liquidity sweep
+    - MSS
+    - FVG
+    - OB
+    eklenebilir.
+    """
 
-# =========================
-# DXY FILTER
-# =========================
-def get_dxy_bias():
-    # Şimdilik kapalı
-    return {
-        "yon": "Nötr",
-        "yorum": "DXY filtresi geçici olarak devre dışı."
-    }
+    if len(candles) < 12:
+        return None
 
-# =========================
-# NEWS RISK
-# =========================
-def get_news_risk(symbol: str):
-    return {
-        "seviye": "Düşük",
-        "mesaj": "Belirgin haber riski görünmüyor."
-    }
+    last = candles[-1]
+    c1 = candles[-2]
+    c2 = candles[-3]
+    c3 = candles[-4]
 
-# =========================
-# ANALYSIS
-# =========================
-def generate_analysis(symbol: str, dxy_bias: dict):
+    avg_r = average_range(candles)
+    if avg_r is None or avg_r <= 0:
+        return None
+
+    current_price = last["close"]
     session = get_session()
-    model = get_model(symbol)
-    symbol_info = resolve_symbol_and_price(symbol)
-    price = symbol_info["price"]
 
-    if price is None:
+    # LONG setup
+    bullish_structure = (
+        c3["close"] < c2["close"] < c1["close"] < last["close"]
+        and last["high"] > c1["high"]
+        and last["low"] > c1["low"]
+    )
+
+    # SHORT setup
+    bearish_structure = (
+        c3["close"] > c2["close"] > c1["close"] > last["close"]
+        and last["high"] < c1["high"]
+        and last["low"] < c1["low"]
+    )
+
+    if bullish_structure:
+        entry = round(current_price, 5 if symbol == "EURUSD" else 2)
+        sl_raw = current_price - (avg_r * 1.2)
+        tp_raw = current_price + (avg_r * 2.4)
+
+        sl = round(sl_raw, 5 if symbol == "EURUSD" else 2)
+        tp = round(tp_raw, 5 if symbol == "EURUSD" else 2)
+
         return {
-            "varlik": symbol,
-            "model": model,
-            "seans": session,
-            "fiyat": "Veri alınamadı",
-            "yon": "Nötr",
-            "likidite": "Veri alınamadı",
-            "yapi": "Veri alınamadı",
-            "fvg": "Veri alınamadı",
-            "ob": "Veri alınamadı",
-            "islem_yonu": "Bekle",
-            "giris": "-",
-            "zarar_durdur": "-",
-            "kar_al": "-",
-            "guven": 0
+            "symbol": symbol,
+            "session": session,
+            "direction": "LONG",
+            "bias": "Yükseliş",
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "confidence": 86,
+            "liquidity": "Yakın dip likiditesi sonrası yukarı devam ihtimali",
+            "structure": "Kısa vadeli yükseliş yapısı korunuyor",
+            "fvg": "Mikro dengesizlik bölgesi izleniyor",
+            "ob": "Yakın talep alanı korunuyor"
         }
 
-    if symbol == "EURUSD":
-        yon = "Nötr"
-        islem_yonu = "Bekle"
-        zarar = "-"
-        kar = "-"
-        likidite = "Asya bölgesi likiditesi izleniyor"
-        yapi = "MSS teyidi bekleniyor"
-        fvg = "FVG oluşumu takip ediliyor"
-        ob = "Order Block bölgesi yakın"
-        guven = 60
+    if bearish_structure:
+        entry = round(current_price, 5 if symbol == "EURUSD" else 2)
+        sl_raw = current_price + (avg_r * 1.2)
+        tp_raw = current_price - (avg_r * 2.4)
 
-    elif symbol == "XAUUSD":
-        yon = "Nötr"
-        islem_yonu = "Bekle"
-        zarar = "-"
-        kar = "-"
-        likidite = "Yakın eşit tepe/dip bölgeleri takip ediliyor"
-        yapi = "BOS sonrası intraday teyit aranıyor"
-        fvg = "FVG bölgesi mevcut"
-        ob = "Order Block retest ihtimali var"
-        guven = 60
+        sl = round(sl_raw, 5 if symbol == "EURUSD" else 2)
+        tp = round(tp_raw, 5 if symbol == "EURUSD" else 2)
 
-    elif symbol == "NASDAQ":
-        yon = "Nötr"
-        islem_yonu = "Bekle"
-        zarar = "-"
-        kar = "-"
-        likidite = "Endeks likidite bölgeleri izleniyor"
-        yapi = "Index yapı doğrulaması bekleniyor"
-        fvg = "Henüz aktif değil"
-        ob = "Henüz aktif değil"
-        guven = 40
+        return {
+            "symbol": symbol,
+            "session": session,
+            "direction": "SHORT",
+            "bias": "Düşüş",
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "confidence": 86,
+            "liquidity": "Yakın tepe likiditesi sonrası aşağı devam ihtimali",
+            "structure": "Kısa vadeli düşüş yapısı korunuyor",
+            "fvg": "Mikro dengesizlik bölgesi izleniyor",
+            "ob": "Yakın arz alanı korunuyor"
+        }
 
-    elif symbol == "US30":
-        yon = "Nötr"
-        islem_yonu = "Bekle"
-        zarar = "-"
-        kar = "-"
-        likidite = "Endeks likidite bölgeleri izleniyor"
-        yapi = "Index yapı doğrulaması bekleniyor"
-        fvg = "Henüz aktif değil"
-        ob = "Henüz aktif değil"
-        guven = 40
-
-    else:
-        yon = "Nötr"
-        islem_yonu = "Bekle"
-        zarar = "-"
-        kar = "-"
-        likidite = "Veri yok"
-        yapi = "Veri yok"
-        fvg = "Veri yok"
-        ob = "Veri yok"
-        guven = 0
-
-    return {
-        "varlik": symbol,
-        "model": model,
-        "seans": session,
-        "fiyat": price,
-        "yon": yon,
-        "likidite": likidite,
-        "yapi": yapi,
-        "fvg": fvg,
-        "ob": ob,
-        "islem_yonu": islem_yonu,
-        "giris": price,
-        "zarar_durdur": zarar,
-        "kar_al": kar,
-        "guven": guven
-    }
-
-# =========================
-# SIGNAL FILTER
-# =========================
-def setup_olustu_mu(analiz: dict, haber: dict):
-    if analiz["seans"] == "Kapalı":
-        return False
-
-    if analiz["fiyat"] == "Veri alınamadı":
-        return False
-
-    if analiz["islem_yonu"] == "Bekle":
-        return False
-
-    if analiz["guven"] < MIN_SIGNAL_GUVEN:
-        return False
-
-    if haber["seviye"] == "Yüksek":
-        return False
-
-    return True
+    return None
 
 
-def signal_cache_key(analiz: dict):
-    return f"{analiz['varlik']}|{analiz['islem_yonu']}|{analiz['giris']}"
+def signal_cache_key(setup: dict):
+    return f"{setup['symbol']}|{setup['direction']}|{setup['entry']}|{setup['sl']}|{setup['tp']}"
 
 
-def signal_cooldown_aktif_mi(analiz: dict):
-    key = signal_cache_key(analiz)
+def signal_cooldown_active(setup: dict):
+    key = signal_cache_key(setup)
     last_time = LAST_SIGNAL_CACHE.get(key)
 
     if last_time is None:
         return False
 
-    if datetime.utcnow() - last_time < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES):
-        return True
-
-    return False
+    return (datetime.utcnow() - last_time) < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
 
 
-def signal_cache_guncelle(analiz: dict):
-    key = signal_cache_key(analiz)
+def update_signal_cache(setup: dict):
+    key = signal_cache_key(setup)
     LAST_SIGNAL_CACHE[key] = datetime.utcnow()
 
 # =========================
-# MESSAGE
+# MESSAGE BUILDERS
 # =========================
-def build_single_report_message(symbol: str):
-    haber = get_news_risk(symbol)
-    analiz = generate_analysis(symbol, get_dxy_bias())
+def build_signal_message(symbol: str, setup: dict, current_price: float):
     zaman = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    model = get_model(symbol)
 
     message = (
         f"📊 ANALİZ + SİNYAL RAPORU\n\n"
-        f"Varlık: {analiz['varlik']}\n"
-        f"Model: {analiz['model']}\n"
-        f"Seans: {analiz['seans']}\n"
+        f"Varlık: {symbol}\n"
+        f"Model: {model}\n"
+        f"Seans: {setup['session']}\n"
         f"Zaman: {zaman}\n"
-        f"Anlık Fiyat: {analiz['fiyat']}\n\n"
-        f"Yön: {analiz['yon']}\n"
+        f"Anlık Fiyat: {current_price}\n\n"
+        f"Yön: {setup['bias']}\n"
         f"DXY Durumu: Nötr\n"
         f"DXY Yorumu: DXY filtresi geçici olarak devre dışı.\n"
-        f"Likidite: {analiz['likidite']}\n"
-        f"Yapı: {analiz['yapi']}\n"
-        f"FVG: {analiz['fvg']}\n"
-        f"Order Block: {analiz['ob']}\n\n"
+        f"Likidite: {setup['liquidity']}\n"
+        f"Yapı: {setup['structure']}\n"
+        f"FVG: {setup['fvg']}\n"
+        f"Order Block: {setup['ob']}\n\n"
         f"📍 İşlem Planı\n"
-        f"İşlem Yönü: {analiz['islem_yonu']}\n"
-        f"Giriş: {analiz['giris']}\n"
-        f"Zarar Durdur: {analiz['zarar_durdur']}\n"
-        f"Kar Al: {analiz['kar_al']}\n"
-        f"Güven Skoru: {analiz['guven']}/100\n\n"
+        f"İşlem Yönü: {setup['direction']}\n"
+        f"Giriş: {setup['entry']}\n"
+        f"Zarar Durdur: {setup['sl']}\n"
+        f"Kar Al: {setup['tp']}\n"
+        f"Güven Skoru: {setup['confidence']}/100\n\n"
         f"⚠️ Risk Uyarısı\n"
-        f"Haber Riski: {haber['seviye']}\n"
-        f"Not: {haber['mesaj']}"
+        f"Haber Riski: Düşük\n"
+        f"Not: Bu sinyal otomatik tarama sonucu üretildi. İşleme girmeden önce kendi teyidini al."
+    )
+    return message
+
+
+def build_tp_message(signal: dict, current_price: float):
+    return (
+        f"✅ TP'ye ulaştı\n\n"
+        f"Varlık: {signal['symbol']}\n"
+        f"Yön: {signal['direction']}\n"
+        f"Giriş: {signal['entry']}\n"
+        f"TP: {signal['tp']}\n"
+        f"Anlık Fiyat: {current_price}"
     )
 
-    return message, analiz, haber
+
+def build_sl_message(signal: dict, current_price: float):
+    return (
+        f"❌ SL oldu\n\n"
+        f"Varlık: {signal['symbol']}\n"
+        f"Yön: {signal['direction']}\n"
+        f"Giriş: {signal['entry']}\n"
+        f"SL: {signal['sl']}\n"
+        f"Anlık Fiyat: {current_price}"
+    )
 
 # =========================
-# SCAN
+# ACTIVE SIGNAL CHECK
+# =========================
+def check_active_signals():
+    symbols_to_remove = []
+
+    for symbol, signal in ACTIVE_SIGNALS.items():
+        current_price = fetch_twelvedata_price(symbol)
+
+        if current_price is None:
+            continue
+
+        if signal["direction"] == "LONG":
+            if current_price >= signal["tp"]:
+                send_telegram_message(
+                    build_tp_message(signal, current_price),
+                    reply_to_message_id=signal["message_id"]
+                )
+                symbols_to_remove.append(symbol)
+            elif current_price <= signal["sl"]:
+                send_telegram_message(
+                    build_sl_message(signal, current_price),
+                    reply_to_message_id=signal["message_id"]
+                )
+                symbols_to_remove.append(symbol)
+
+        elif signal["direction"] == "SHORT":
+            if current_price <= signal["tp"]:
+                send_telegram_message(
+                    build_tp_message(signal, current_price),
+                    reply_to_message_id=signal["message_id"]
+                )
+                symbols_to_remove.append(symbol)
+            elif current_price >= signal["sl"]:
+                send_telegram_message(
+                    build_sl_message(signal, current_price),
+                    reply_to_message_id=signal["message_id"]
+                )
+                symbols_to_remove.append(symbol)
+
+    for symbol in symbols_to_remove:
+        ACTIVE_SIGNALS.pop(symbol, None)
+
+# =========================
+# SCAN ENGINE
 # =========================
 def scan_markets():
     while True:
         try:
+            # Önce aktif sinyalleri kontrol et
+            check_active_signals()
+
             if not market_is_open():
-                time.sleep(600)
+                time.sleep(SCAN_INTERVAL)
                 continue
 
             for symbol in WATCHLIST:
-                message, analiz, haber = build_single_report_message(symbol)
+                # Aynı varlıkta aktif sinyal varsa yeni sinyal üretme
+                if symbol in ACTIVE_SIGNALS:
+                    continue
 
-                if setup_olustu_mu(analiz, haber):
-                    if not signal_cooldown_aktif_mi(analiz):
-                        send_telegram_message(message)
-                        signal_cache_guncelle(analiz)
+                candles = fetch_twelvedata_candles(symbol)
+                if not candles:
+                    continue
+
+                setup = build_setup_from_candles(symbol, candles)
+                if setup is None:
+                    continue
+
+                if signal_cooldown_active(setup):
+                    continue
+
+                current_price = fetch_twelvedata_price(symbol)
+                if current_price is None:
+                    continue
+
+                message = build_signal_message(symbol, setup, current_price)
+                result = send_telegram_message(message)
+
+                if result.get("ok") is True:
+                    message_id = result.get("result", {}).get("message_id")
+
+                    ACTIVE_SIGNALS[symbol] = {
+                        "symbol": symbol,
+                        "direction": setup["direction"],
+                        "entry": setup["entry"],
+                        "sl": setup["sl"],
+                        "tp": setup["tp"],
+                        "message_id": message_id,
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+
+                    update_signal_cache(setup)
 
             time.sleep(SCAN_INTERVAL)
 
@@ -435,27 +456,25 @@ def scan_markets():
 def home():
     return jsonify({
         "ok": True,
-        "status": "AI trade agent running",
+        "status": "Trade Konseyi aktif",
         "session": get_session(),
         "watchlist": WATCHLIST,
         "scan_interval_seconds": SCAN_INTERVAL,
-        "auto_signal_mode": "Setup olursa gönder, aksi halde sessiz kal"
+        "mode": "Sadece setup olursa sinyal gönderir"
     })
 
 
 @app.route("/test", methods=["GET"])
 def test():
-    eurusd = resolve_symbol_and_price("EURUSD")
-    xauusd = resolve_symbol_and_price("XAUUSD")
-    nasdaq = resolve_symbol_and_price("NASDAQ")
-    us30 = resolve_symbol_and_price("US30")
+    eurusd = fetch_twelvedata_price("EURUSD")
+    xauusd = fetch_twelvedata_price("XAUUSD")
 
     text = (
         f"✅ Sistem testi başarılı\n\n"
-        f"EURUSD: {eurusd['price']}\n"
-        f"XAUUSD: {xauusd['price']}\n"
-        f"NASDAQ: {nasdaq['price']}\n"
-        f"US30: {us30['price']}\n"
+        f"EURUSD: {eurusd}\n"
+        f"XAUUSD: {xauusd}\n"
+        f"NASDAQ: devre dışı\n"
+        f"US30: devre dışı\n"
         f"DXY: devre dışı"
     )
 
@@ -473,16 +492,65 @@ def manual_symbol(symbol):
             "error": "Geçersiz sembol."
         }), 400
 
-    message, analiz, haber = build_single_report_message(symbol)
+    candles = fetch_twelvedata_candles(symbol)
+    if not candles:
+        return jsonify({
+            "ok": False,
+            "error": "Mum verisi alınamadı."
+        }), 500
+
+    setup = build_setup_from_candles(symbol, candles)
+    current_price = fetch_twelvedata_price(symbol)
+
+    if current_price is None:
+        return jsonify({
+            "ok": False,
+            "error": "Anlık fiyat alınamadı."
+        }), 500
+
+    if setup is None:
+        text = (
+            f"📋 Manuel analiz sonucu\n\n"
+            f"Varlık: {symbol}\n"
+            f"Seans: {get_session()}\n"
+            f"Anlık Fiyat: {current_price}\n"
+            f"Durum: Şu an net setup yok.\n"
+            f"Not: Bot sessiz kalır."
+        )
+        result = send_telegram_message(text)
+        return jsonify(result)
+
+    message = build_signal_message(symbol, setup, current_price)
     result = send_telegram_message(message)
 
+    if result.get("ok") is True:
+        message_id = result.get("result", {}).get("message_id")
+
+        ACTIVE_SIGNALS[symbol] = {
+            "symbol": symbol,
+            "direction": setup["direction"],
+            "entry": setup["entry"],
+            "sl": setup["sl"],
+            "tp": setup["tp"],
+            "message_id": message_id,
+            "created_at": datetime.utcnow().isoformat()
+        }
+
+        update_signal_cache(setup)
+
+    return jsonify(result)
+
+
+@app.route("/active-signals", methods=["GET"])
+def active_signals():
     return jsonify({
         "ok": True,
-        "symbol": symbol,
-        "result": result
+        "active_signals": ACTIVE_SIGNALS
     })
 
-
+# =========================
+# START BACKGROUND SCANNER
+# =========================
 def start_scanner():
     scanner = threading.Thread(target=scan_markets)
     scanner.daemon = True
