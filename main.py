@@ -13,7 +13,7 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+INDICES_API_KEY = os.getenv("INDICES_API_API_KEY")
 
 # =========================
 # AYARLAR
@@ -26,11 +26,10 @@ WATCHLIST = [
     "DXY",
 ]
 
-SCAN_INTERVAL = 300 # 5 dakika
+SCAN_INTERVAL = 300  # 5 dakika
 MIN_SIGNAL_GUVEN = 85
 SIGNAL_COOLDOWN_MINUTES = 60
 
-# Aynı sinyali tekrar tekrar atmasın
 LAST_SIGNAL_CACHE = {}
 
 # =========================
@@ -81,7 +80,7 @@ def get_model(symbol: str):
         return "ICT Intraday"
 
 # =========================
-# VERİ SAĞLAYICILARI
+# TWELVEDATA
 # =========================
 def fetch_twelvedata_price(symbol: str):
     if not TWELVEDATA_API_KEY:
@@ -104,57 +103,72 @@ def fetch_twelvedata_price(symbol: str):
     except Exception:
         return None
 
+# =========================
+# INDICES API
+# =========================
+def fetch_indices_api_latest(symbols):
+    """
+    symbols: ['NDX', 'DJI', 'DXY'] gibi liste
+    """
+    if not INDICES_API_KEY:
+        return {}
 
-def fetch_finnhub_quote(symbol: str):
-    if not FINNHUB_API_KEY:
-        return None
+    joined_symbols = ",".join(symbols)
 
-    url = "https://finnhub.io/api/v1/quote"
+    url = "https://indices-api.com/api/latest"
     params = {
-        "symbol": symbol,
-        "token": FINNHUB_API_KEY
+        "access_key": INDICES_API_KEY,
+        "base": "USD",
+        "symbols": joined_symbols
     }
 
     try:
         response = requests.get(url, params=params, timeout=20)
         data = response.json()
 
-        # Finnhub quote cevabında son fiyat genelde "c"
-        price = data.get("c")
-        if price is None:
-            return None
+        # Beklenen yapı:
+        # {
+        #   "success": true,
+        #   "base": "USD",
+        #   "rates": {
+        #       "NDX": ...,
+        #       "DJI": ...,
+        #       "DXY": ...
+        #   }
+        # }
+        rates = data.get("rates", {})
+        if isinstance(rates, dict):
+            return rates
 
-        try:
-            price = float(price)
-        except Exception:
-            return None
+        return {}
+    except Exception:
+        return {}
 
-        if price <= 0:
-            return None
 
-        return price
+def fetch_single_index(symbol_code: str):
+    data = fetch_indices_api_latest([symbol_code])
+    value = data.get(symbol_code)
+
+    try:
+        if value is None:
+            return None
+        return float(value)
     except Exception:
         return None
 
-
+# =========================
+# SEMBOL -> FİYAT
+# =========================
 def resolve_symbol_and_price(symbol: str):
-    """
-    Hangi marketi hangi API'den alacağımızı burada belirliyoruz.
-    Test mesajında da hangi sembolün kullanıldığını göstereceğiz.
-    """
-
-    # EURUSD -> TwelveData
     if symbol == "EURUSD":
         resolved_symbol = "EUR/USD"
         price = fetch_twelvedata_price(resolved_symbol)
         return {
             "requested": symbol,
-            "provider": "TwelveData",
             "resolved_symbol": resolved_symbol,
             "price": price
         }
 
-    # XAUUSD -> TwelveData
     if symbol == "XAUUSD":
         candidates = ["XAU/USD", "XAUUSD"]
         for candidate in candidates:
@@ -162,102 +176,51 @@ def resolve_symbol_and_price(symbol: str):
             if price is not None:
                 return {
                     "requested": symbol,
-                    "provider": "TwelveData",
                     "resolved_symbol": candidate,
                     "price": price
                 }
-
         return {
             "requested": symbol,
-            "provider": "TwelveData",
             "resolved_symbol": None,
             "price": None
         }
 
-    # NASDAQ -> Finnhub
     if symbol == "NASDAQ":
-        candidates = [
-            "^NDX",
-            "NDX",
-            "QQQ"
-        ]
-        for candidate in candidates:
-            price = fetch_finnhub_quote(candidate)
-            if price is not None:
-                return {
-                    "requested": symbol,
-                    "provider": "Finnhub",
-                    "resolved_symbol": candidate,
-                    "price": price
-                }
-
+        resolved_symbol = "NDX"
+        price = fetch_single_index(resolved_symbol)
         return {
             "requested": symbol,
-            "provider": "Finnhub",
-            "resolved_symbol": None,
-            "price": None
+            "resolved_symbol": resolved_symbol,
+            "price": price
         }
 
-    # US30 -> Finnhub
     if symbol == "US30":
-        candidates = [
-            "^DJI",
-            "DJI",
-            "DIA"
-        ]
-        for candidate in candidates:
-            price = fetch_finnhub_quote(candidate)
-            if price is not None:
-                return {
-                    "requested": symbol,
-                    "provider": "Finnhub",
-                    "resolved_symbol": candidate,
-                    "price": price
-                }
-
+        resolved_symbol = "DJI"
+        price = fetch_single_index(resolved_symbol)
         return {
             "requested": symbol,
-            "provider": "Finnhub",
-            "resolved_symbol": None,
-            "price": None
+            "resolved_symbol": resolved_symbol,
+            "price": price
         }
 
-    # DXY -> Finnhub
     if symbol == "DXY":
-        candidates = [
-            "DXY",
-            "DX-Y.NYB",
-            "USDX",
-            "^DXY"
-        ]
-        for candidate in candidates:
-            price = fetch_finnhub_quote(candidate)
-            if price is not None:
-                return {
-                    "requested": symbol,
-                    "provider": "Finnhub",
-                    "resolved_symbol": candidate,
-                    "price": price
-                }
-
+        resolved_symbol = "DXY"
+        price = fetch_single_index(resolved_symbol)
         return {
             "requested": symbol,
-            "provider": "Finnhub",
-            "resolved_symbol": None,
-            "price": None
+            "resolved_symbol": resolved_symbol,
+            "price": price
         }
 
     return {
         "requested": symbol,
-        "provider": "Unknown",
         "resolved_symbol": None,
         "price": None
     }
 
 
 def get_price(symbol: str):
-    result = resolve_symbol_and_price(symbol)
-    return result["price"]
+    return resolve_symbol_and_price(symbol)["price"]
 
 # =========================
 # DXY YÖN FİLTRESİ
@@ -270,34 +233,26 @@ def get_dxy_bias():
         return {
             "yon": "Nötr",
             "yorum": "DXY verisi alınamadı.",
-            "sembol": dxy_info["resolved_symbol"],
-            "fiyat": None,
-            "provider": dxy_info["provider"]
+            "fiyat": None
         }
 
-    # Geçici basit mantık
     if dxy_price >= 100:
         return {
             "yon": "Yükseliş",
             "yorum": f"Dolar güçlü görünüyor. Anlık DXY: {dxy_price}",
-            "sembol": dxy_info["resolved_symbol"],
-            "fiyat": dxy_price,
-            "provider": dxy_info["provider"]
+            "fiyat": dxy_price
         }
     else:
         return {
             "yon": "Düşüş",
             "yorum": f"Dolar zayıf görünüyor. Anlık DXY: {dxy_price}",
-            "sembol": dxy_info["resolved_symbol"],
-            "fiyat": dxy_price,
-            "provider": dxy_info["provider"]
+            "fiyat": dxy_price
         }
 
 # =========================
 # HABER RİSKİ
 # =========================
 def get_news_risk(symbol: str):
-    # Şimdilik placeholder
     return {
         "seviye": "Düşük",
         "mesaj": "Belirgin haber riski görünmüyor."
@@ -317,8 +272,6 @@ def generate_analysis(symbol: str, dxy_bias: dict):
             "varlik": symbol,
             "model": model,
             "seans": session,
-            "provider": symbol_info["provider"],
-            "cozulen_sembol": symbol_info["resolved_symbol"],
             "fiyat": "Veri alınamadı",
             "yon": "Nötr",
             "likidite": "Veri alınamadı",
@@ -332,7 +285,6 @@ def generate_analysis(symbol: str, dxy_bias: dict):
             "guven": 0
         }
 
-    # EURUSD
     if symbol == "EURUSD":
         yon = (
             "Düşüş" if dxy_bias["yon"] == "Yükseliş"
@@ -351,11 +303,8 @@ def generate_analysis(symbol: str, dxy_bias: dict):
         yapi = "MSS teyidi bekleniyor"
         fvg = "FVG oluşumu takip ediliyor"
         ob = "Order Block bölgesi yakın"
-
-        # Şimdilik gerçek ICT motoru yok, güveni bilinçli düşük tutuyoruz
         guven = 60
 
-    # XAUUSD
     elif symbol == "XAUUSD":
         yon = (
             "Düşüş" if dxy_bias["yon"] == "Yükseliş"
@@ -374,33 +323,28 @@ def generate_analysis(symbol: str, dxy_bias: dict):
         yapi = "BOS sonrası intraday teyit aranıyor"
         fvg = "FVG bölgesi mevcut"
         ob = "Order Block retest ihtimali var"
-
         guven = 60
 
-    # NASDAQ
     elif symbol == "NASDAQ":
         yon = "Nötr"
         islem_yonu = "Bekle"
         zarar = "-"
         kar = "-"
-        likidite = "Index verisi izleniyor"
+        likidite = "Endeks verisi izleniyor"
         yapi = "Doğrulama aşamasında"
         fvg = "Henüz aktif değil"
         ob = "Henüz aktif değil"
-
         guven = 40
 
-    # US30
     elif symbol == "US30":
         yon = "Nötr"
         islem_yonu = "Bekle"
         zarar = "-"
         kar = "-"
-        likidite = "Index verisi izleniyor"
+        likidite = "Endeks verisi izleniyor"
         yapi = "Doğrulama aşamasında"
         fvg = "Henüz aktif değil"
         ob = "Henüz aktif değil"
-
         guven = 40
 
     else:
@@ -418,8 +362,6 @@ def generate_analysis(symbol: str, dxy_bias: dict):
         "varlik": symbol,
         "model": model,
         "seans": session,
-        "provider": symbol_info["provider"],
-        "cozulen_sembol": symbol_info["resolved_symbol"],
         "fiyat": price,
         "yon": yon,
         "likidite": likidite,
@@ -437,13 +379,6 @@ def generate_analysis(symbol: str, dxy_bias: dict):
 # SETUP FİLTRESİ
 # =========================
 def setup_olustu_mu(analiz: dict, haber: dict):
-    """
-    Burada artık spam'i engelliyoruz.
-    Bot sadece gerçek setup oluştuğunda mesaj atmalı.
-    Şimdilik çok sıkı tutuyoruz.
-    Gerçek ICT motoru gelince burada MSS/FVG/OB/Sweep kontrolü olacak.
-    """
-
     if analiz["seans"] == "Kapalı":
         return False
 
@@ -501,15 +436,10 @@ def build_single_report_message(symbol: str):
         f"Model: {analiz['model']}\n"
         f"Seans: {analiz['seans']}\n"
         f"Zaman: {zaman}\n"
-        f"Veri Sağlayıcı: {analiz['provider']}\n"
-        f"Kullanılan Sembol: {analiz['cozulen_sembol']}\n"
         f"Anlık Fiyat: {analiz['fiyat']}\n\n"
         f"Yön: {analiz['yon']}\n"
         f"DXY Durumu: {dxy['yon']}\n"
         f"DXY Yorumu: {dxy['yorum']}\n"
-        f"DXY Sağlayıcı: {dxy['provider']}\n"
-        f"DXY Sembolü: {dxy['sembol']}\n"
-        f"DXY Fiyatı: {dxy['fiyat']}\n"
         f"Likidite: {analiz['likidite']}\n"
         f"Yapı: {analiz['yapi']}\n"
         f"FVG: {analiz['fvg']}\n"
@@ -546,7 +476,6 @@ def scan_markets():
                 if message is None:
                     continue
 
-                # Sadece setup varsa gönder
                 if setup_olustu_mu(analiz, haber):
                     if not signal_cooldown_aktif_mi(analiz):
                         send_telegram_message(message)
@@ -582,11 +511,11 @@ def test():
 
     text = (
         f"✅ Sistem testi başarılı\n\n"
-        f"EURUSD → {eurusd['provider']} → {eurusd['resolved_symbol']} → {eurusd['price']}\n"
-        f"XAUUSD → {xauusd['provider']} → {xauusd['resolved_symbol']} → {xauusd['price']}\n"
-        f"NASDAQ → {nasdaq['provider']} → {nasdaq['resolved_symbol']} → {nasdaq['price']}\n"
-        f"US30 → {us30['provider']} → {us30['resolved_symbol']} → {us30['price']}\n"
-        f"DXY → {dxy['provider']} → {dxy['resolved_symbol']} → {dxy['price']}"
+        f"EURUSD: {eurusd['price']}\n"
+        f"XAUUSD: {xauusd['price']}\n"
+        f"NASDAQ: {nasdaq['price']}\n"
+        f"US30: {us30['price']}\n"
+        f"DXY: {dxy['price']}"
     )
 
     result = send_telegram_message(text)
