@@ -1,9 +1,9 @@
-  
 from flask import Flask, jsonify
 import requests
 import os
 import time
 import threading
+import json
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
@@ -32,7 +32,50 @@ SIGNAL_COOLDOWN_MINUTES = 90
 MIN_SIGNAL_CONFIDENCE = 85
 
 LAST_SIGNAL_CACHE = {}
+ACTIVE_SIGNALS_FILE = "active_signals.json"
 ACTIVE_SIGNALS = {}
+
+# =========================
+# FILE STORAGE
+# =========================
+def load_active_signals():
+    global ACTIVE_SIGNALS
+
+    if not os.path.exists(ACTIVE_SIGNALS_FILE):
+        ACTIVE_SIGNALS = {}
+        save_active_signals()
+        return
+
+    try:
+        with open(ACTIVE_SIGNALS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            ACTIVE_SIGNALS = data
+        else:
+            ACTIVE_SIGNALS = {}
+    except Exception:
+        ACTIVE_SIGNALS = {}
+        save_active_signals()
+
+
+def save_active_signals():
+    try:
+        with open(ACTIVE_SIGNALS_FILE, "w", encoding="utf-8") as f:
+            json.dump(ACTIVE_SIGNALS, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def set_active_signal(symbol: str, signal_data: dict):
+    ACTIVE_SIGNALS[symbol] = signal_data
+    save_active_signals()
+
+
+def remove_active_signal(symbol: str):
+    if symbol in ACTIVE_SIGNALS:
+        ACTIVE_SIGNALS.pop(symbol, None)
+        save_active_signals()
 
 # =========================
 # TELEGRAM
@@ -298,7 +341,6 @@ def detect_htf_bias(htf_candles):
     if last < low_20:
         return "Düşüş"
 
-    # Basit trend yönü
     last5 = [c["close"] for c in htf_candles[-5:]]
     rising = all(last5[i] > last5[i - 1] for i in range(1, len(last5)))
     falling = all(last5[i] < last5[i - 1] for i in range(1, len(last5)))
@@ -323,7 +365,6 @@ def detect_liquidity_sweep(ltf_candles, symbol):
 
     if last_high:
         _, swing_high_value = last_high
-        # yukarı likidite alınıp kapanış altında kaldıysa bearish sweep
         if last["high"] > swing_high_value and last["close"] < swing_high_value:
             return {
                 "type": "bearish",
@@ -333,7 +374,6 @@ def detect_liquidity_sweep(ltf_candles, symbol):
 
     if last_low:
         _, swing_low_value = last_low
-        # aşağı likidite alınıp kapanış üstünde kaldıysa bullish sweep
         if last["low"] < swing_low_value and last["close"] > swing_low_value:
             return {
                 "type": "bullish",
@@ -430,7 +470,6 @@ def detect_premium_discount(ltf_candles, symbol):
         return None
 
     eq = (dealing_high + dealing_low) / 2
-
     zone = "discount" if current < eq else "premium"
 
     return {
@@ -438,19 +477,11 @@ def detect_premium_discount(ltf_candles, symbol):
         "high": round_price(symbol, dealing_high),
         "low": round_price(symbol, dealing_low),
         "equilibrium": round_price(symbol, eq),
-        "text": (
-            f"Discount bölgesinde" if zone == "discount"
-            else f"Premium bölgesinde"
-        )
+        "text": "Discount bölgesinde" if zone == "discount" else "Premium bölgesinde"
     }
 
 
 def detect_true_order_block(ltf_candles, direction, symbol):
-    """
-    Basit true OB yaklaşımı:
-    LONG için MSS öncesindeki son bearish mum
-    SHORT için MSS öncesindeki son bullish mum
-    """
     if len(ltf_candles) < 20:
         return None
 
@@ -510,20 +541,7 @@ def analyze_market(symbol: str):
 
     direction = "Bekle"
     confidence = 40
-    analysis_notes = []
 
-    if sweep:
-        analysis_notes.append(sweep["text"])
-    if mss:
-        analysis_notes.append(mss["text"])
-    if fvg:
-        analysis_notes.append(fvg["text"])
-    if displacement and displacement["active"]:
-        analysis_notes.append("Displacement güçlü")
-    if pd:
-        analysis_notes.append(pd["text"])
-
-    # LONG SETUP
     if (
         session_info["trade_window"]
         and sweep
@@ -540,7 +558,6 @@ def analyze_market(symbol: str):
         direction = "LONG"
         confidence = 90
 
-    # SHORT SETUP
     elif (
         session_info["trade_window"]
         and sweep
@@ -557,8 +574,10 @@ def analyze_market(symbol: str):
         direction = "SHORT"
         confidence = 90
 
-    ob = detect_true_order_block(ltf_candles, direction if direction != "Bekle" else "LONG", symbol)
-    if direction == "SHORT":
+    ob = None
+    if direction == "LONG":
+        ob = detect_true_order_block(ltf_candles, "LONG", symbol)
+    elif direction == "SHORT":
         ob = detect_true_order_block(ltf_candles, "SHORT", symbol)
 
     avg_r = average_range(ltf_candles, 14)
@@ -595,8 +614,7 @@ def analyze_market(symbol: str):
         "entry": entry,
         "sl": sl,
         "tp": tp,
-        "confidence": confidence,
-        "notes": analysis_notes
+        "confidence": confidence
     }
 
 # =========================
@@ -705,17 +723,23 @@ def check_active_signals():
 
         current_price = round_price(symbol, current_price)
 
+        try:
+            message_id = int(signal["message_id"]) if signal.get("message_id") is not None else None
+        except Exception:
+            message_id = None
+
         if signal["direction"] == "LONG":
             if current_price >= signal["tp"]:
                 send_telegram_message(
                     build_tp_message(signal, current_price),
-                    reply_to_message_id=signal["message_id"]
+                    reply_to_message_id=message_id
                 )
                 symbols_to_remove.append(symbol)
+
             elif current_price <= signal["sl"]:
                 send_telegram_message(
                     build_sl_message(signal, current_price),
-                    reply_to_message_id=signal["message_id"]
+                    reply_to_message_id=message_id
                 )
                 symbols_to_remove.append(symbol)
 
@@ -723,18 +747,19 @@ def check_active_signals():
             if current_price <= signal["tp"]:
                 send_telegram_message(
                     build_tp_message(signal, current_price),
-                    reply_to_message_id=signal["message_id"]
+                    reply_to_message_id=message_id
                 )
                 symbols_to_remove.append(symbol)
+
             elif current_price >= signal["sl"]:
                 send_telegram_message(
                     build_sl_message(signal, current_price),
-                    reply_to_message_id=signal["message_id"]
+                    reply_to_message_id=message_id
                 )
                 symbols_to_remove.append(symbol)
 
     for symbol in symbols_to_remove:
-        ACTIVE_SIGNALS.pop(symbol, None)
+        remove_active_signal(symbol)
 
 # =========================
 # SCAN ENGINE
@@ -771,7 +796,7 @@ def scan_markets():
                 if result.get("ok") is True:
                     message_id = result.get("result", {}).get("message_id")
 
-                    ACTIVE_SIGNALS[symbol] = {
+                    set_active_signal(symbol, {
                         "symbol": symbol,
                         "direction": analysis["direction"],
                         "entry": analysis["entry"],
@@ -779,7 +804,7 @@ def scan_markets():
                         "tp": analysis["tp"],
                         "message_id": message_id,
                         "created_at": datetime.utcnow().isoformat()
-                    }
+                    })
 
                     update_signal_cache(analysis)
 
@@ -848,7 +873,7 @@ def manual_symbol(symbol):
     if result.get("ok") is True:
         message_id = result.get("result", {}).get("message_id")
 
-        ACTIVE_SIGNALS[symbol] = {
+        set_active_signal(symbol, {
             "symbol": symbol,
             "direction": analysis["direction"],
             "entry": analysis["entry"],
@@ -856,7 +881,7 @@ def manual_symbol(symbol):
             "tp": analysis["tp"],
             "message_id": message_id,
             "created_at": datetime.utcnow().isoformat()
-        }
+        })
 
         update_signal_cache(analysis)
 
@@ -870,10 +895,21 @@ def active_signals():
         "active_signals": ACTIVE_SIGNALS
     })
 
+
+@app.route("/reload-signals", methods=["GET"])
+def reload_signals():
+    load_active_signals()
+    return jsonify({
+        "ok": True,
+        "message": "Active signals yeniden yüklendi.",
+        "active_signals": ACTIVE_SIGNALS
+    })
+
 # =========================
-# START BACKGROUND SCANNER
+# STARTUP
 # =========================
 def start_scanner():
+    load_active_signals()
     scanner = threading.Thread(target=scan_markets)
     scanner.daemon = True
     scanner.start()
@@ -882,5 +918,6 @@ def start_scanner():
 start_scanner()
 
 if __name__ == "__main__":
+    load_active_signals()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
