@@ -34,7 +34,6 @@ DEFAULT_TP_ATR_MULT = 2.20
 
 STATE_FILE = "bot_state.json"
 
-# News filter
 NEWS_BLOCK_BEFORE_MIN = 30
 NEWS_BLOCK_AFTER_MIN = 15
 NEWS_CACHE_MINUTES = 15
@@ -263,26 +262,30 @@ def get_hist_raw(symbol: str, exchange: str, interval: Interval, n_bars: int) ->
     if tv is None:
         return None
 
-    try:
-        df = tv.get_hist(symbol=symbol, exchange=exchange, interval=interval, n_bars=n_bars)
-        if df is None or df.empty:
-            return None
+    for _ in range(2):
+        try:
+            df = tv.get_hist(symbol=symbol, exchange=exchange, interval=interval, n_bars=n_bars)
+            if df is None or df.empty:
+                time.sleep(1)
+                continue
 
-        df = df.reset_index()
+            df = df.reset_index()
 
-        if "datetime" in df.columns:
-            df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+            if "datetime" in df.columns:
+                df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
 
-        keep_cols = [c for c in ["datetime", "open", "high", "low", "close", "volume"] if c in df.columns]
-        df = df[keep_cols]
+            keep_cols = [c for c in ["datetime", "open", "high", "low", "close", "volume"] if c in df.columns]
+            df = df[keep_cols]
 
-        for c in ["open", "high", "low", "close", "volume"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
+            for c in ["open", "high", "low", "close", "volume"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
 
-        return df
-    except Exception:
-        return None
+            return df
+        except Exception:
+            time.sleep(1)
+
+    return None
 
 
 def get_market_pack(market: str) -> Optional[Dict[str, pd.DataFrame]]:
@@ -745,27 +748,18 @@ def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame
     if pair and pair in data:
         smt = detect_smt(df_5m, data[pair]["5m"])
 
-    # ------------------------------
-    # REQUIRED
-    # ------------------------------
     killzone_pass = sess["killzone"]
     sweep_pass_long = (sweep["type"] == "bullish") or (asia["sweep"] == "asia_low_swept")
     sweep_pass_short = (sweep["type"] == "bearish") or (asia["sweep"] == "asia_high_swept")
     structure_pass_long = (mss["type"] == "bullish") or (choch["type"] == "bullish")
     structure_pass_short = (mss["type"] == "bearish") or (choch["type"] == "bearish")
 
-    # ------------------------------
-    # STRONG CONFIRMATION
-    # ------------------------------
     ob_proximity_long = near_zone(price, ob["zone"]) if ob["type"] == "bullish" else False
     ob_proximity_short = near_zone(price, ob["zone"]) if ob["type"] == "bearish" else False
 
     smt_long = smt["type"] == "bullish"
     smt_short = smt["type"] == "bearish"
 
-    # ------------------------------
-    # OPTIONAL
-    # ------------------------------
     retest_pass_long = near_zone(price, ob["zone"]) or near_zone(price, fvg["zone"])
     retest_pass_short = near_zone(price, ob["zone"]) or near_zone(price, fvg["zone"])
 
@@ -774,8 +768,13 @@ def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame
 
     if htf_bias == "Yükseliş":
         long_score += 25
+        short_score -= 8
     elif htf_bias == "Düşüş":
         short_score += 25
+        long_score -= 8
+    else:
+        long_score += 8
+        short_score += 8
 
     if sweep_pass_long:
         long_score += 20
@@ -791,7 +790,6 @@ def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame
         long_score += 10
         short_score += 10
 
-    # strong confirmation
     if smt_long:
         long_score += 10
     if smt_short:
@@ -802,7 +800,6 @@ def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame
     if ob_proximity_short:
         short_score += 10
 
-    # optional
     if displacement["strong"]:
         long_score += 5
         short_score += 5
@@ -832,12 +829,17 @@ def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame
     if retest_pass_short:
         short_score += 4
 
-    # direction
     direction = "Bekle"
     confidence = max(long_score, short_score)
 
-    hard_long = (htf_bias == "Yükseliş") and killzone_pass and sweep_pass_long and structure_pass_long
-    hard_short = (htf_bias == "Düşüş") and killzone_pass and sweep_pass_short and structure_pass_short
+    bias_long_ok = htf_bias in ["Yükseliş", "Nötr"]
+    bias_short_ok = htf_bias in ["Düşüş", "Nötr"]
+
+    trigger_long_ok = killzone_pass or sweep_pass_long
+    trigger_short_ok = killzone_pass or sweep_pass_short
+
+    hard_long = bias_long_ok and structure_pass_long and trigger_long_ok
+    hard_short = bias_short_ok and structure_pass_short and trigger_short_ok
 
     if not news["blocked"]:
         if hard_long and long_score >= MIN_SIGNAL_CONFIDENCE and long_score > short_score:
@@ -845,11 +847,16 @@ def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame
         elif hard_short and short_score >= MIN_SIGNAL_CONFIDENCE and short_score > long_score:
             direction = "SHORT"
 
-    # tier
     signal_tier = "Yok"
     if direction == "LONG":
         strong_hits = int(smt_long) + int(ob_proximity_long)
-        optional_hits = int(displacement["strong"]) + int(retest_pass_long) + int(fvg["type"] == "bullish") + int(ifvg["type"] == "bullish") + int(cisd["type"] == "bullish")
+        optional_hits = (
+            int(displacement["strong"])
+            + int(retest_pass_long)
+            + int(fvg["type"] == "bullish")
+            + int(ifvg["type"] == "bullish")
+            + int(cisd["type"] == "bullish")
+        )
         if strong_hits >= 1 and optional_hits >= 1:
             signal_tier = "A++"
         elif strong_hits >= 1:
@@ -859,7 +866,13 @@ def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame
 
     elif direction == "SHORT":
         strong_hits = int(smt_short) + int(ob_proximity_short)
-        optional_hits = int(displacement["strong"]) + int(retest_pass_short) + int(fvg["type"] == "bearish") + int(ifvg["type"] == "bearish") + int(cisd["type"] == "bearish")
+        optional_hits = (
+            int(displacement["strong"])
+            + int(retest_pass_short)
+            + int(fvg["type"] == "bearish")
+            + int(ifvg["type"] == "bearish")
+            + int(cisd["type"] == "bearish")
+        )
         if strong_hits >= 1 and optional_hits >= 1:
             signal_tier = "A++"
         elif strong_hits >= 1:
@@ -909,13 +922,14 @@ def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame
         "entry": entry,
         "sl": sl,
         "tp": tp,
-        "confidence": min(confidence, 100),
+        "confidence": max(0, min(confidence, 100)),
         "signal_tier": signal_tier,
         "scores": {"long": long_score, "short": short_score},
         "filters": {
             "killzone": killzone_pass,
             "sweep": sweep_pass_long if direction == "LONG" else sweep_pass_short if direction == "SHORT" else (sweep_pass_long or sweep_pass_short),
             "structure": structure_pass_long if direction == "LONG" else structure_pass_short if direction == "SHORT" else (structure_pass_long or structure_pass_short),
+            "trigger": trigger_long_ok if direction == "LONG" else trigger_short_ok if direction == "SHORT" else (trigger_long_ok or trigger_short_ok),
             "smt": smt_long if direction == "LONG" else smt_short if direction == "SHORT" else (smt_long or smt_short),
             "ob_proximity": ob_proximity_long if direction == "LONG" else ob_proximity_short if direction == "SHORT" else (ob_proximity_long or ob_proximity_short),
             "displacement": displacement["strong"],
@@ -952,6 +966,7 @@ def build_manual_text(a: Dict[str, Any]) -> str:
         f"Killzone filtresi: {'Geçti' if a['filters']['killzone'] else 'Kaldı'}\n"
         f"Sweep filtresi: {'Geçti' if a['filters']['sweep'] else 'Kaldı'}\n"
         f"Yapı filtresi: {'Geçti' if a['filters']['structure'] else 'Kaldı'}\n"
+        f"Killzone/Sweep tetik filtresi: {'Geçti' if a['filters']['trigger'] else 'Kaldı'}\n"
         f"SMT teyidi: {'Var' if a['filters']['smt'] else 'Yok'}\n"
         f"OB proximity teyidi: {'Var' if a['filters']['ob_proximity'] else 'Yok'}\n"
         f"Displacement filtresi: {'Geçti' if a['filters']['displacement'] else 'Kaldı'}\n"
@@ -992,6 +1007,7 @@ def build_signal_text(a: Dict[str, Any]) -> str:
         f"Killzone filtresi: {'Geçti' if a['filters']['killzone'] else 'Kaldı'}\n"
         f"Sweep filtresi: {'Geçti' if a['filters']['sweep'] else 'Kaldı'}\n"
         f"Yapı filtresi: {'Geçti' if a['filters']['structure'] else 'Kaldı'}\n"
+        f"Killzone/Sweep tetik filtresi: {'Geçti' if a['filters']['trigger'] else 'Kaldı'}\n"
         f"SMT teyidi: {'Var' if a['filters']['smt'] else 'Yok'}\n"
         f"OB proximity teyidi: {'Var' if a['filters']['ob_proximity'] else 'Yok'}\n"
         f"Displacement filtresi: {'Geçti' if a['filters']['displacement'] else 'Kaldı'}\n"
