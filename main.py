@@ -246,12 +246,21 @@ def save_state() -> None:
 def init_tv() -> bool:
     global tv
     try:
+        print(f"TV_USERNAME dolu mu: {'evet' if bool(TV_USERNAME) else 'hayır'}")
+        print(f"TV_PASSWORD dolu mu: {'evet' if bool(TV_PASSWORD) else 'hayır'}")
+        print(f"TV_USERNAME: {TV_USERNAME}")
+
         if TV_USERNAME and TV_PASSWORD:
+            print("TradingView login ile bağlanılıyor...")
             tv = TvDatafeed(username=TV_USERNAME, password=TV_PASSWORD)
+            print("TradingView login denemesi tamamlandı.")
         else:
+            print("Login bilgisi yok, nologin moda düşülüyor...")
             tv = TvDatafeed()
+
         return True
-    except Exception:
+    except Exception as e:
+        print(f"init_tv hatası: {e}")
         tv = None
         return False
 
