@@ -1,10 +1,11 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 import os
 import time
 import json
+import gc
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import pandas as pd
 import requests
@@ -13,29 +14,28 @@ from tvDatafeed import TvDatafeed, Interval
 app = Flask(__name__)
 
 # =========================================================
-# ENV / SETTINGS
+# ENV
 # =========================================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TV_USERNAME = os.getenv("TV_USERNAME")
-TV_PASSWORD = os.getenv("TV_PASSWORD")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TV_USERNAME = os.getenv("TV_USERNAME", "").strip()
+TV_PASSWORD = os.getenv("TV_PASSWORD", "").strip()
 
-DEFAULT_ALLOWED = "8463420441"
-ALLOWED_CHAT_IDS = [
-    int(x.strip()) for x in os.getenv("ALLOWED_CHAT_IDS", DEFAULT_ALLOWED).split(",") if x.strip()
-]
+# =========================================================
+# SETTINGS
+# =========================================================
+SCAN_INTERVAL_SECONDS = 30
+MIN_SIGNAL_CONFIDENCE = 74
+STRONG_SIGNAL_CONFIDENCE = 82
+SIGNAL_COOLDOWN_MINUTES = 45
+
+DEFAULT_SL_ATR_MULT = 1.20
+DEFAULT_TP_ATR_MULT = 2.20
 
 STATE_FILE = "bot_state.json"
-SCAN_INTERVAL_SECONDS = 30
-MIN_SIGNAL_CONFIDENCE = 82
-SIGNAL_COOLDOWN_MINUTES = 45
-MAX_ACTIVE_SIGNALS = 20
-
-DEFAULT_SL_ATR_MULT = 1.25
-DEFAULT_TP_ATR_MULT = 2.50
 
 # =========================================================
-# MARKET CONFIG
+# MARKETS
 # =========================================================
 MARKETS: Dict[str, Dict[str, str]] = {
     "EURUSD": {"symbol": "EURUSD", "exchange": "OANDA"},
@@ -62,11 +62,128 @@ SMT_PAIRS = {
 # GLOBALS
 # =========================================================
 tv: Optional[TvDatafeed] = None
+
 STATE: Dict[str, Any] = {
     "active_signals": {},
     "recent_signal_keys": {},
     "last_scan_at": None,
 }
+
+_last_scan_data_cache: Dict[str, Dict[str, pd.DataFrame]] = {}
+_last_scan_data_ts: Optional[datetime] = None
+CACHE_TTL_SECONDS = 20
+
+
+# =========================================================
+# GENERAL
+# =========================================================
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def round_price(market: str, value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    if market in ["EURUSD", "GBPUSD", "USDJPY"]:
+        return round(float(value), 5)
+    return round(float(value), 2)
+
+
+def df_last_close(df: Optional[pd.DataFrame]) -> Optional[float]:
+    if df is None or df.empty:
+        return None
+    return float(df.iloc[-1]["close"])
+
+
+def avg_range(df: pd.DataFrame, lookback: int = 14) -> Optional[float]:
+    if df is None or len(df) < lookback:
+        return None
+    x = df.tail(lookback)
+    return float((x["high"] - x["low"]).mean())
+
+
+def candle_body(row: pd.Series) -> float:
+    return abs(float(row["close"] - row["open"]))
+
+
+def candle_range(row: pd.Series) -> float:
+    return float(row["high"] - row["low"])
+
+
+def local_high(df: pd.DataFrame, idx: int, left: int = 2, right: int = 2) -> bool:
+    if idx - left < 0 or idx + right >= len(df):
+        return False
+    level = float(df.iloc[idx]["high"])
+    for i in range(idx - left, idx + right + 1):
+        if i == idx:
+            continue
+        if float(df.iloc[i]["high"]) >= level:
+            return False
+    return True
+
+
+def local_low(df: pd.DataFrame, idx: int, left: int = 2, right: int = 2) -> bool:
+    if idx - left < 0 or idx + right >= len(df):
+        return False
+    level = float(df.iloc[idx]["low"])
+    for i in range(idx - left, idx + right + 1):
+        if i == idx:
+            continue
+        if float(df.iloc[i]["low"]) <= level:
+            return False
+    return True
+
+
+def last_swing_high(df: pd.DataFrame, lookback: int = 60) -> Optional[Tuple[int, float]]:
+    if df is None or len(df) < 10:
+        return None
+    start = max(2, len(df) - lookback)
+    result = None
+    for i in range(start, len(df) - 2):
+        if local_high(df, i):
+            result = (i, float(df.iloc[i]["high"]))
+    return result
+
+
+def last_swing_low(df: pd.DataFrame, lookback: int = 60) -> Optional[Tuple[int, float]]:
+    if df is None or len(df) < 10:
+        return None
+    start = max(2, len(df) - lookback)
+    result = None
+    for i in range(start, len(df) - 2):
+        if local_low(df, i):
+            result = (i, float(df.iloc[i]["low"]))
+    return result
+
+
+def session_info() -> Dict[str, Any]:
+    h = utc_now().hour
+
+    if 0 <= h < 6:
+        return {"session": "Asya", "killzone": False}
+    if 6 <= h < 10:
+        return {"session": "Londra Killzone", "killzone": True}
+    if 10 <= h < 13:
+        return {"session": "Londra", "killzone": False}
+    if 13 <= h < 16:
+        return {"session": "London-NY Overlap", "killzone": True}
+    if 16 <= h < 18:
+        return {"session": "New York Killzone", "killzone": True}
+    if 18 <= h < 21:
+        return {"session": "New York", "killzone": False}
+    return {"session": "Geçiş", "killzone": False}
+
+
+def near_zone(price: Optional[float], zone: Optional[Tuple[float, float]], tolerance_ratio: float = 0.15) -> bool:
+    if price is None or zone is None:
+        return False
+    lo, hi = zone
+    width = hi - lo
+    if width <= 0:
+        return False
+    tol = width * tolerance_ratio
+    return (lo - tol) <= price <= (hi + tol)
+
 
 # =========================================================
 # TELEGRAM
@@ -91,18 +208,14 @@ def send_telegram_message(text: str, reply_to_message_id: Optional[int] = None) 
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
     }
-
     if reply_to_message_id is not None:
         payload["reply_to_message_id"] = reply_to_message_id
 
     return telegram_api("sendMessage", payload)
 
 
-def is_allowed_chat(chat_id: int) -> bool:
-    return chat_id in ALLOWED_CHAT_IDS
-
 # =========================================================
-# STATE STORAGE
+# STATE
 # =========================================================
 def load_state() -> None:
     global STATE
@@ -110,7 +223,6 @@ def load_state() -> None:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-
             if isinstance(raw, dict):
                 STATE["active_signals"] = raw.get("active_signals", {})
                 STATE["recent_signal_keys"] = raw.get("recent_signal_keys", {})
@@ -126,8 +238,9 @@ def save_state() -> None:
     except Exception:
         pass
 
+
 # =========================================================
-# TV DATA
+# TV INIT
 # =========================================================
 def init_tv() -> bool:
     global tv
@@ -142,202 +255,100 @@ def init_tv() -> bool:
         return False
 
 
-def get_hist(market_name: str, interval: Interval, n_bars: int = 250) -> Optional[pd.DataFrame]:
+# =========================================================
+# DATA FETCH
+# =========================================================
+def get_hist_raw(symbol: str, exchange: str, interval: Interval, n_bars: int) -> Optional[pd.DataFrame]:
     if tv is None:
         return None
 
-    cfg = MARKETS[market_name]
-
     try:
-        df = tv.get_hist(
-            symbol=cfg["symbol"],
-            exchange=cfg["exchange"],
-            interval=interval,
-            n_bars=n_bars,
-        )
-
+        df = tv.get_hist(symbol=symbol, exchange=exchange, interval=interval, n_bars=n_bars)
         if df is None or df.empty:
             return None
 
         df = df.reset_index()
+
         if "datetime" in df.columns:
             df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+
+        # sadece gerekli kolonları tut
+        keep_cols = [c for c in ["datetime", "open", "high", "low", "close", "volume"] if c in df.columns]
+        df = df[keep_cols]
+
+        # tip küçültme
+        for c in ["open", "high", "low", "close", "volume"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
 
         return df
     except Exception:
         return None
 
-# =========================================================
-# GENERAL HELPERS
-# =========================================================
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
 
+def get_market_pack(market: str) -> Optional[Dict[str, pd.DataFrame]]:
+    cfg = MARKETS[market]
+    symbol = cfg["symbol"]
+    exchange = cfg["exchange"]
 
-def round_price(market: str, value: Optional[float]) -> Optional[float]:
-    if value is None:
+    df_5m = get_hist_raw(symbol, exchange, Interval.in_5_minute, 180)
+    df_15m = get_hist_raw(symbol, exchange, Interval.in_15_minute, 120)
+    df_1h = get_hist_raw(symbol, exchange, Interval.in_1_hour, 100)
+
+    if df_5m is None or df_15m is None or df_1h is None:
         return None
 
-    if market in ["EURUSD", "GBPUSD", "USDJPY"]:
-        return round(float(value), 5)
-
-    return round(float(value), 2)
+    return {"5m": df_5m, "15m": df_15m, "1h": df_1h}
 
 
-def last_close(df: pd.DataFrame) -> Optional[float]:
-    if df is None or df.empty:
-        return None
-    return float(df.iloc[-1]["close"])
+def build_scan_cache(force_refresh: bool = False) -> Dict[str, Dict[str, pd.DataFrame]]:
+    global _last_scan_data_cache, _last_scan_data_ts
 
+    now = utc_now()
 
-def avg_range(df: pd.DataFrame, lookback: int = 14) -> Optional[float]:
-    if df is None or len(df) < lookback:
-        return None
-    sample = df.tail(lookback)
-    return float((sample["high"] - sample["low"]).mean())
+    if (
+        not force_refresh
+        and _last_scan_data_ts is not None
+        and (now - _last_scan_data_ts).total_seconds() < CACHE_TTL_SECONDS
+        and _last_scan_data_cache
+    ):
+        return _last_scan_data_cache
 
+    cache: Dict[str, Dict[str, pd.DataFrame]] = {}
 
-def candle_body(row: pd.Series) -> float:
-    return abs(float(row["close"] - row["open"]))
+    for market in MARKETS.keys():
+        pack = get_market_pack(market)
+        if pack is not None:
+            cache[market] = pack
+        time.sleep(0.15)
 
+    _last_scan_data_cache = cache
+    _last_scan_data_ts = now
+    gc.collect()
+    return cache
 
-def candle_range(row: pd.Series) -> float:
-    return float(row["high"] - row["low"])
-
-
-def local_high(df: pd.DataFrame, idx: int, left: int = 2, right: int = 2) -> bool:
-    if idx - left < 0 or idx + right >= len(df):
-        return False
-
-    h = float(df.iloc[idx]["high"])
-    for i in range(idx - left, idx + right + 1):
-        if i == idx:
-            continue
-        if float(df.iloc[i]["high"]) >= h:
-            return False
-    return True
-
-
-def local_low(df: pd.DataFrame, idx: int, left: int = 2, right: int = 2) -> bool:
-    if idx - left < 0 or idx + right >= len(df):
-        return False
-
-    low = float(df.iloc[idx]["low"])
-    for i in range(idx - left, idx + right + 1):
-        if i == idx:
-            continue
-        if float(df.iloc[i]["low"]) <= low:
-            return False
-    return True
-
-
-def last_swing_high(df: pd.DataFrame, lookback: int = 80) -> Optional[Tuple[int, float]]:
-    if df is None or len(df) < 10:
-        return None
-
-    start = max(2, len(df) - lookback)
-    result = None
-
-    for i in range(start, len(df) - 2):
-        if local_high(df, i):
-            result = (i, float(df.iloc[i]["high"]))
-
-    return result
-
-
-def last_swing_low(df: pd.DataFrame, lookback: int = 80) -> Optional[Tuple[int, float]]:
-    if df is None or len(df) < 10:
-        return None
-
-    start = max(2, len(df) - lookback)
-    result = None
-
-    for i in range(start, len(df) - 2):
-        if local_low(df, i):
-            result = (i, float(df.iloc[i]["low"]))
-
-    return result
-
-
-def session_info() -> Dict[str, Any]:
-    h = utc_now().hour
-
-    if 0 <= h < 6:
-        return {"session": "Asya", "killzone": False}
-    if 6 <= h < 10:
-        return {"session": "Londra Killzone", "killzone": True}
-    if 10 <= h < 13:
-        return {"session": "Londra", "killzone": False}
-    if 13 <= h < 16:
-        return {"session": "London-NY Overlap", "killzone": True}
-    if 16 <= h < 18:
-        return {"session": "New York Killzone", "killzone": True}
-    if 18 <= h < 21:
-        return {"session": "New York", "killzone": False}
-
-    return {"session": "Geçiş", "killzone": False}
-
-
-def price_in_zone(price: Optional[float], zone: Optional[Tuple[float, float]]) -> bool:
-    if price is None or zone is None:
-        return False
-
-    lo, hi = zone
-    return lo <= price <= hi
-
-
-def near_zone(price: Optional[float], zone: Optional[Tuple[float, float]], tolerance_ratio: float = 0.15) -> bool:
-    if price is None or zone is None:
-        return False
-
-    lo, hi = zone
-    width = hi - lo
-    if width <= 0:
-        return False
-
-    tolerance = width * tolerance_ratio
-    return (lo - tolerance) <= price <= (hi + tolerance)
-
-
-def valid_entry_retest(
-    direction: str,
-    price: Optional[float],
-    ob_zone: Optional[Tuple[float, float]],
-    fvg_zone: Optional[Tuple[float, float]],
-) -> bool:
-    if price is None:
-        return False
-
-    in_ob = near_zone(price, ob_zone)
-    in_fvg = near_zone(price, fvg_zone)
-
-    if direction in ["LONG", "SHORT"]:
-        return in_ob or in_fvg
-
-    return False
 
 # =========================================================
-# ICT ANALYSIS COMPONENTS
+# ANALYSIS PIECES
 # =========================================================
-def detect_htf_bias(df_4h: pd.DataFrame, df_1h: pd.DataFrame) -> str:
-    if df_4h is None or df_1h is None or len(df_4h) < 60 or len(df_1h) < 60:
+def detect_htf_bias(df_1h: pd.DataFrame, df_15m: pd.DataFrame) -> str:
+    if df_1h is None or df_15m is None or len(df_1h) < 40 or len(df_15m) < 40:
         return "Nötr"
 
-    close_4h = df_4h["close"]
-    close_1h = df_1h["close"]
+    c1 = df_1h["close"]
+    c15 = df_15m["close"]
 
-    ema20_4h = close_4h.ewm(span=20).mean().iloc[-1]
-    ema50_4h = close_4h.ewm(span=50).mean().iloc[-1]
-    ema20_1h = close_1h.ewm(span=20).mean().iloc[-1]
-    ema50_1h = close_1h.ewm(span=50).mean().iloc[-1]
+    ema20_1h = c1.ewm(span=20).mean().iloc[-1]
+    ema50_1h = c1.ewm(span=50).mean().iloc[-1]
+    ema20_15m = c15.ewm(span=20).mean().iloc[-1]
 
-    last_4h = float(close_4h.iloc[-1])
-    last_1h = float(close_1h.iloc[-1])
+    last1 = float(c1.iloc[-1])
+    last15 = float(c15.iloc[-1])
 
-    if last_4h > ema20_4h > ema50_4h and last_1h > ema20_1h > ema50_1h:
+    if last1 > ema20_1h > ema50_1h and last15 > ema20_15m:
         return "Yükseliş"
 
-    if last_4h < ema20_4h < ema50_4h and last_1h < ema20_1h < ema50_1h:
+    if last1 < ema20_1h < ema50_1h and last15 < ema20_15m:
         return "Düşüş"
 
     return "Nötr"
@@ -350,8 +361,8 @@ def detect_liquidity_sweep(df_5m: pd.DataFrame) -> Dict[str, Any]:
     prev = df_5m.iloc[:-1]
     last = df_5m.iloc[-1]
 
-    h = last_swing_high(prev, 60)
-    l = last_swing_low(prev, 60)
+    h = last_swing_high(prev, 55)
+    l = last_swing_low(prev, 55)
 
     if h:
         _, level = h
@@ -376,32 +387,27 @@ def detect_mss(df_5m: pd.DataFrame) -> Dict[str, Any]:
     h = last_swing_high(prev, 50)
     l = last_swing_low(prev, 50)
 
-    if h:
-        _, level = h
-        if float(last["close"]) > level:
-            return {"label": "Bullish MSS", "type": "bullish", "level": level}
+    if h and float(last["close"]) > h[1]:
+        return {"label": "Bullish MSS", "type": "bullish", "level": h[1]}
 
-    if l:
-        _, level = l
-        if float(last["close"]) < level:
-            return {"label": "Bearish MSS", "type": "bearish", "level": level}
+    if l and float(last["close"]) < l[1]:
+        return {"label": "Bearish MSS", "type": "bearish", "level": l[1]}
 
     return {"label": "Yok", "type": None, "level": None}
 
 
 def detect_choch(df_15m: pd.DataFrame) -> Dict[str, Any]:
-    if df_15m is None or len(df_15m) < 80:
+    if df_15m is None or len(df_15m) < 60:
         return {"label": "Yok", "type": None}
 
     prev = df_15m.iloc[:-1]
     last = df_15m.iloc[-1]
 
-    h = last_swing_high(prev, 70)
-    l = last_swing_low(prev, 70)
+    h = last_swing_high(prev, 45)
+    l = last_swing_low(prev, 45)
 
     if h and float(last["close"]) > h[1]:
         return {"label": "Bullish CHoCH", "type": "bullish"}
-
     if l and float(last["close"]) < l[1]:
         return {"label": "Bearish CHoCH", "type": "bearish"}
 
@@ -409,18 +415,18 @@ def detect_choch(df_15m: pd.DataFrame) -> Dict[str, Any]:
 
 
 def detect_displacement(df_5m: pd.DataFrame) -> Dict[str, Any]:
-    if df_5m is None or len(df_5m) < 20:
+    if df_5m is None or len(df_5m) < 18:
         return {"label": "Zayıf", "strong": False}
 
-    last = df_5m.iloc[-1]
     ar = avg_range(df_5m.iloc[:-1], 14)
     if ar is None:
         return {"label": "Zayıf", "strong": False}
 
+    last = df_5m.iloc[-1]
     rng = candle_range(last)
     body = candle_body(last)
 
-    strong = rng >= ar * 1.5 and body >= ar * 0.8
+    strong = rng >= ar * 1.45 and body >= ar * 0.70
     return {"label": "Güçlü" if strong else "Zayıf", "strong": strong}
 
 
@@ -436,14 +442,14 @@ def detect_fvg(df_5m: pd.DataFrame) -> Dict[str, Any]:
         return {
             "label": "Bullish FVG",
             "type": "bullish",
-            "zone": (float(a["high"]), float(c["low"]))
+            "zone": (float(a["high"]), float(c["low"])),
         }
 
     if float(a["low"]) > float(c["high"]) and float(b["close"]) < float(b["open"]):
         return {
             "label": "Bearish FVG",
             "type": "bearish",
-            "zone": (float(c["high"]), float(a["low"]))
+            "zone": (float(c["high"]), float(a["low"])),
         }
 
     return {"label": "Yok", "type": None, "zone": None}
@@ -454,64 +460,61 @@ def detect_ifvg(df_5m: pd.DataFrame) -> Dict[str, Any]:
         return {"label": "Yok", "type": None}
 
     recent = df_5m.tail(8).reset_index(drop=True)
+    left = recent.iloc[:5]
+    right = recent.iloc[5:]
 
-    mid = recent.iloc[:5]
-    end = recent.iloc[5:]
+    base = detect_fvg(left)
+    if base["zone"] is None:
+        return {"label": "Yok", "type": None}
 
-    fvg = detect_fvg(mid)
+    z1, z2 = base["zone"]
+    last_close_ = float(right.iloc[-1]["close"])
 
-    if fvg["type"] == "bullish" and fvg["zone"] is not None:
-        zone_low, zone_high = fvg["zone"]
-        last_close_ = float(end.iloc[-1]["close"])
-        if last_close_ < zone_low:
-            return {"label": "Bearish iFVG", "type": "bearish"}
+    if base["type"] == "bullish" and last_close_ < z1:
+        return {"label": "Bearish iFVG", "type": "bearish"}
 
-    if fvg["type"] == "bearish" and fvg["zone"] is not None:
-        zone_low, zone_high = fvg["zone"]
-        last_close_ = float(end.iloc[-1]["close"])
-        if last_close_ > zone_high:
-            return {"label": "Bullish iFVG", "type": "bullish"}
+    if base["type"] == "bearish" and last_close_ > z2:
+        return {"label": "Bullish iFVG", "type": "bullish"}
 
     return {"label": "Yok", "type": None}
 
 
 def detect_cisd(df_5m: pd.DataFrame) -> Dict[str, Any]:
-    if df_5m is None or len(df_5m) < 25:
+    if df_5m is None or len(df_5m) < 16:
         return {"label": "Yok", "type": None}
 
-    recent = df_5m.tail(10).reset_index(drop=True)
-    first_half = recent.iloc[:5]
-    second_half = recent.iloc[5:]
+    x = df_5m.tail(10).reset_index(drop=True)
+    first = x.iloc[:5]
+    second = x.iloc[5:]
 
-    first_move = float(first_half.iloc[-1]["close"] - first_half.iloc[0]["open"])
-    second_move = float(second_half.iloc[-1]["close"] - second_half.iloc[0]["open"])
+    first_move = float(first.iloc[-1]["close"] - first.iloc[0]["open"])
+    second_move = float(second.iloc[-1]["close"] - second.iloc[0]["open"])
 
-    if first_move < 0 and second_move > abs(first_move) * 0.6:
+    if first_move < 0 and second_move > abs(first_move) * 0.55:
         return {"label": "Bullish CISD", "type": "bullish"}
 
-    if first_move > 0 and second_move < -abs(first_move) * 0.6:
+    if first_move > 0 and second_move < -abs(first_move) * 0.55:
         return {"label": "Bearish CISD", "type": "bearish"}
 
     return {"label": "Yok", "type": None}
 
 
 def detect_pd_zone(df_5m: pd.DataFrame) -> str:
-    if df_5m is None or len(df_5m) < 50:
+    if df_5m is None or len(df_5m) < 40:
         return "Belirsiz"
 
-    hi = float(df_5m.tail(40)["high"].max())
-    lo = float(df_5m.tail(40)["low"].min())
+    hi = float(df_5m.tail(35)["high"].max())
+    lo = float(df_5m.tail(35)["low"].min())
     eq = (hi + lo) / 2
-    close_now = float(df_5m.iloc[-1]["close"])
-
-    return "Discount" if close_now < eq else "Premium"
+    px = float(df_5m.iloc[-1]["close"])
+    return "Discount" if px < eq else "Premium"
 
 
 def detect_true_order_block(df_5m: pd.DataFrame) -> Dict[str, Any]:
-    if df_5m is None or len(df_5m) < 30:
+    if df_5m is None or len(df_5m) < 20:
         return {"label": "Yok", "type": None, "zone": None}
 
-    recent = df_5m.tail(15).reset_index(drop=True)
+    recent = df_5m.tail(12).reset_index(drop=True)
 
     for i in range(len(recent) - 3, 1, -1):
         cur = recent.iloc[i]
@@ -522,7 +525,7 @@ def detect_true_order_block(df_5m: pd.DataFrame) -> Dict[str, Any]:
                 return {
                     "label": "Bullish OB",
                     "type": "bullish",
-                    "zone": (float(cur["low"]), float(cur["high"]))
+                    "zone": (float(cur["low"]), float(cur["high"])),
                 }
 
     for i in range(len(recent) - 3, 1, -1):
@@ -534,25 +537,25 @@ def detect_true_order_block(df_5m: pd.DataFrame) -> Dict[str, Any]:
                 return {
                     "label": "Bearish OB",
                     "type": "bearish",
-                    "zone": (float(cur["low"]), float(cur["high"]))
+                    "zone": (float(cur["low"]), float(cur["high"])),
                 }
 
     return {"label": "Yok", "type": None, "zone": None}
 
 
 def detect_asia_range_context(df_5m: pd.DataFrame) -> Dict[str, Any]:
-    if df_5m is None or "datetime" not in df_5m.columns or len(df_5m) < 80:
+    if df_5m is None or "datetime" not in df_5m.columns or len(df_5m) < 60:
         return {"label": "Belirsiz", "high": None, "low": None, "sweep": None}
 
     df = df_5m.copy()
     df["date"] = df["datetime"].dt.date
     today = utc_now().date()
-    today_rows = df[df["date"] == today]
+    rows = df[df["date"] == today]
 
-    if today_rows.empty:
+    if rows.empty:
         return {"label": "Belirsiz", "high": None, "low": None, "sweep": None}
 
-    asia = today_rows[(today_rows["datetime"].dt.hour >= 0) & (today_rows["datetime"].dt.hour < 6)]
+    asia = rows[(rows["datetime"].dt.hour >= 0) & (rows["datetime"].dt.hour < 6)]
     if asia.empty:
         return {"label": "Belirsiz", "high": None, "low": None, "sweep": None}
 
@@ -575,22 +578,24 @@ def detect_asia_range_context(df_5m: pd.DataFrame) -> Dict[str, Any]:
     return {"label": label, "high": asia_high, "low": asia_low, "sweep": sweep}
 
 
-def detect_smt(primary_market: str, primary_df: pd.DataFrame, comparison_df: pd.DataFrame) -> Dict[str, Any]:
-    if primary_df is None or comparison_df is None or len(primary_df) < 30 or len(comparison_df) < 30:
+def detect_smt(primary_df: pd.DataFrame, comparison_df: pd.DataFrame) -> Dict[str, Any]:
+    if primary_df is None or comparison_df is None or len(primary_df) < 35 or len(comparison_df) < 35:
         return {"label": "Yok", "type": None}
 
-    p_last = primary_df.tail(10)
-    c_last = comparison_df.tail(10)
+    p_prev = primary_df.iloc[:-8].tail(20)
+    c_prev = comparison_df.iloc[:-8].tail(20)
+    p_now = primary_df.tail(8)
+    c_now = comparison_df.tail(8)
 
-    p_hi_prev = float(primary_df.iloc[:-10].tail(20)["high"].max())
-    c_hi_prev = float(comparison_df.iloc[:-10].tail(20)["high"].max())
-    p_lo_prev = float(primary_df.iloc[:-10].tail(20)["low"].min())
-    c_lo_prev = float(comparison_df.iloc[:-10].tail(20)["low"].min())
+    p_hi_prev = float(p_prev["high"].max())
+    c_hi_prev = float(c_prev["high"].max())
+    p_lo_prev = float(p_prev["low"].min())
+    c_lo_prev = float(c_prev["low"].min())
 
-    p_hi_now = float(p_last["high"].max())
-    c_hi_now = float(c_last["high"].max())
-    p_lo_now = float(p_last["low"].min())
-    c_lo_now = float(c_last["low"].min())
+    p_hi_now = float(p_now["high"].max())
+    c_hi_now = float(c_now["high"].max())
+    p_lo_now = float(p_now["low"].min())
+    c_lo_now = float(c_now["low"].min())
 
     if p_lo_now < p_lo_prev and c_lo_now >= c_lo_prev:
         return {"label": "Bullish SMT", "type": "bullish"}
@@ -600,23 +605,27 @@ def detect_smt(primary_market: str, primary_df: pd.DataFrame, comparison_df: pd.
 
     return {"label": "Yok", "type": None}
 
+
 # =========================================================
 # ANALYSIS ENGINE
 # =========================================================
-def analyze_market(market_name: str) -> Optional[Dict[str, Any]]:
-    df_5m = get_hist(market_name, Interval.in_5_minute, 250)
-    df_15m = get_hist(market_name, Interval.in_15_minute, 250)
-    df_1h = get_hist(market_name, Interval.in_1_hour, 250)
-    df_4h = get_hist(market_name, Interval.in_4_hour, 250)
+def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None) -> Optional[Dict[str, Any]]:
+    data = cache if cache is not None else build_scan_cache(force_refresh=False)
 
-    if any(x is None for x in [df_5m, df_15m, df_1h, df_4h]):
+    if market not in data:
         return None
 
-    price = round_price(market_name, last_close(df_5m))
+    pack = data[market]
+    df_5m = pack["5m"]
+    df_15m = pack["15m"]
+    df_1h = pack["1h"]
+
+    price = round_price(market, df_last_close(df_5m))
     if price is None:
         return None
 
-    htf_bias = detect_htf_bias(df_4h, df_1h)
+    sess = session_info()
+    htf_bias = detect_htf_bias(df_1h, df_15m)
     sweep = detect_liquidity_sweep(df_5m)
     mss = detect_mss(df_5m)
     choch = detect_choch(df_15m)
@@ -627,15 +636,13 @@ def analyze_market(market_name: str) -> Optional[Dict[str, Any]]:
     pd_zone = detect_pd_zone(df_5m)
     ob = detect_true_order_block(df_5m)
     asia = detect_asia_range_context(df_5m)
-    sess = session_info()
 
     smt = {"label": "Yok", "type": None}
-    pair = SMT_PAIRS.get(market_name)
-    if pair and pair in MARKETS:
-        pair_df = get_hist(pair, Interval.in_5_minute, 250)
-        if pair_df is not None:
-            smt = detect_smt(market_name, df_5m, pair_df)
+    pair = SMT_PAIRS.get(market)
+    if pair and pair in data:
+        smt = detect_smt(df_5m, data[pair]["5m"])
 
+    # scores
     long_score = 0
     short_score = 0
 
@@ -645,9 +652,14 @@ def analyze_market(market_name: str) -> Optional[Dict[str, Any]]:
         short_score += 20
 
     if sweep["type"] == "bullish":
-        long_score += 15
+        long_score += 18
     elif sweep["type"] == "bearish":
-        short_score += 15
+        short_score += 18
+
+    if asia["sweep"] == "asia_low_swept":
+        long_score += 10
+    elif asia["sweep"] == "asia_high_swept":
+        short_score += 10
 
     if mss["type"] == "bullish":
         long_score += 18
@@ -655,13 +667,13 @@ def analyze_market(market_name: str) -> Optional[Dict[str, Any]]:
         short_score += 18
 
     if choch["type"] == "bullish":
-        long_score += 8
+        long_score += 10
     elif choch["type"] == "bearish":
-        short_score += 8
+        short_score += 10
 
     if displacement["strong"]:
-        long_score += 10
-        short_score += 10
+        long_score += 8
+        short_score += 8
 
     if fvg["type"] == "bullish":
         long_score += 8
@@ -669,9 +681,9 @@ def analyze_market(market_name: str) -> Optional[Dict[str, Any]]:
         short_score += 8
 
     if ifvg["type"] == "bullish":
-        long_score += 10
+        long_score += 8
     elif ifvg["type"] == "bearish":
-        short_score += 10
+        short_score += 8
 
     if cisd["type"] == "bullish":
         long_score += 10
@@ -683,29 +695,23 @@ def analyze_market(market_name: str) -> Optional[Dict[str, Any]]:
     elif pd_zone == "Premium":
         short_score += 8
 
-    if ob["type"] == "bullish" and price_in_zone(price, ob["zone"]):
-        long_score += 12
-    elif ob["type"] == "bearish" and price_in_zone(price, ob["zone"]):
-        short_score += 12
-
-    if asia["sweep"] == "asia_low_swept":
-        long_score += 8
-    elif asia["sweep"] == "asia_high_swept":
-        short_score += 8
+    if ob["type"] == "bullish" and near_zone(price, ob["zone"]):
+        long_score += 10
+    elif ob["type"] == "bearish" and near_zone(price, ob["zone"]):
+        short_score += 10
 
     if sess["killzone"]:
         long_score += 5
         short_score += 5
 
     if smt["type"] == "bullish":
-        long_score += 8
+        long_score += 7
     elif smt["type"] == "bearish":
-        short_score += 8
-
-    direction = "Bekle"
-    confidence = max(long_score, short_score)
+        short_score += 7
 
     candidate_direction = "Bekle"
+    confidence = max(long_score, short_score)
+
     if long_score >= MIN_SIGNAL_CONFIDENCE and long_score > short_score:
         candidate_direction = "LONG"
         confidence = long_score
@@ -713,54 +719,39 @@ def analyze_market(market_name: str) -> Optional[Dict[str, Any]]:
         candidate_direction = "SHORT"
         confidence = short_score
 
-    sweep_required = False
-    killzone_required = sess["killzone"]
-    displacement_required = displacement["strong"]
-    entry_retest_required = False
+    # hard filters
+    killzone_pass = sess["killzone"]
+    sweep_pass_long = (sweep["type"] == "bullish") or (asia["sweep"] == "asia_low_swept")
+    sweep_pass_short = (sweep["type"] == "bearish") or (asia["sweep"] == "asia_high_swept")
+    structure_pass_long = (mss["type"] == "bullish") or (choch["type"] == "bullish")
+    structure_pass_short = (mss["type"] == "bearish") or (choch["type"] == "bearish")
 
-    fvg_zone = fvg["zone"] if fvg["zone"] is not None else None
-    ob_zone = ob["zone"] if ob["zone"] is not None else None
+    retest_pass_long = near_zone(price, ob["zone"]) or near_zone(price, fvg["zone"])
+    retest_pass_short = near_zone(price, ob["zone"]) or near_zone(price, fvg["zone"])
+
+    direction = "Bekle"
 
     if candidate_direction == "LONG":
-        sweep_required = sweep["type"] == "bullish"
-        entry_retest_required = valid_entry_retest("LONG", price, ob_zone, fvg_zone)
-
-        if (
-            htf_bias == "Yükseliş"
-            and sweep_required
-            and killzone_required
-            and displacement_required
-            and entry_retest_required
-            and (mss["type"] == "bullish" or choch["type"] == "bullish")
-        ):
+        if htf_bias == "Yükseliş" and killzone_pass and sweep_pass_long and structure_pass_long:
             direction = "LONG"
 
     elif candidate_direction == "SHORT":
-        sweep_required = sweep["type"] == "bearish"
-        entry_retest_required = valid_entry_retest("SHORT", price, ob_zone, fvg_zone)
-
-        if (
-            htf_bias == "Düşüş"
-            and sweep_required
-            and killzone_required
-            and displacement_required
-            and entry_retest_required
-            and (mss["type"] == "bearish" or choch["type"] == "bearish")
-        ):
+        if htf_bias == "Düşüş" and killzone_pass and sweep_pass_short and structure_pass_short:
             direction = "SHORT"
 
+    # entry / sl / tp
     ar = avg_range(df_5m, 14)
     if ar is None:
         return None
 
     if direction == "LONG":
         entry = price
-        sl = round_price(market_name, price - ar * DEFAULT_SL_ATR_MULT)
-        tp = round_price(market_name, price + ar * DEFAULT_TP_ATR_MULT)
+        sl = round_price(market, price - ar * DEFAULT_SL_ATR_MULT)
+        tp = round_price(market, price + ar * DEFAULT_TP_ATR_MULT)
     elif direction == "SHORT":
         entry = price
-        sl = round_price(market_name, price + ar * DEFAULT_SL_ATR_MULT)
-        tp = round_price(market_name, price - ar * DEFAULT_TP_ATR_MULT)
+        sl = round_price(market, price + ar * DEFAULT_SL_ATR_MULT)
+        tp = round_price(market, price - ar * DEFAULT_TP_ATR_MULT)
     else:
         entry = price
         sl = "-"
@@ -768,10 +759,22 @@ def analyze_market(market_name: str) -> Optional[Dict[str, Any]]:
 
     ob_text = ob["label"]
     if ob["zone"] is not None:
-        ob_text = f"{ob['label']} ({round_price(market_name, ob['zone'][0])} - {round_price(market_name, ob['zone'][1])})"
+        ob_text = f"{ob['label']} ({round_price(market, ob['zone'][0])} - {round_price(market, ob['zone'][1])})"
+
+    signal_tier = "Yok"
+    if direction != "Bekle":
+        extra_strength = 0
+        if displacement["strong"]:
+            extra_strength += 1
+        if (direction == "LONG" and retest_pass_long) or (direction == "SHORT" and retest_pass_short):
+            extra_strength += 1
+        if confidence >= STRONG_SIGNAL_CONFIDENCE and extra_strength >= 1:
+            signal_tier = "A+"
+        else:
+            signal_tier = "Standart"
 
     return {
-        "market": market_name,
+        "market": market,
         "session": sess["session"],
         "killzone": sess["killzone"],
         "price": price,
@@ -792,23 +795,114 @@ def analyze_market(market_name: str) -> Optional[Dict[str, Any]]:
         "sl": sl,
         "tp": tp,
         "confidence": min(confidence, 100),
+        "signal_tier": signal_tier,
         "scores": {"long": long_score, "short": short_score},
         "filters": {
-            "killzone_required": killzone_required,
-            "displacement_required": displacement_required,
-            "sweep_required": sweep_required,
-            "entry_retest_required": entry_retest_required,
+            "killzone": killzone_pass,
+            "sweep": sweep_pass_long if direction == "LONG" else sweep_pass_short if direction == "SHORT" else False,
+            "structure": structure_pass_long if direction == "LONG" else structure_pass_short if direction == "SHORT" else False,
+            "displacement": displacement["strong"],
+            "retest": retest_pass_long if direction == "LONG" else retest_pass_short if direction == "SHORT" else False,
         },
     }
 
+
 # =========================================================
-# SIGNAL HELPERS
+# TEXT BUILDERS
 # =========================================================
-def signal_key(analysis: Dict[str, Any]) -> str:
+def build_manual_text(a: Dict[str, Any]) -> str:
     return (
-        f"{analysis['market']}|{analysis['direction']}|"
-        f"{analysis['entry']}|{analysis['sl']}|{analysis['tp']}"
+        f"📋 Manuel analiz sonucu\n\n"
+        f"Varlık: {a['market']}\n"
+        f"Seans: {a['session']}\n"
+        f"Killzone: {'Evet' if a['killzone'] else 'Hayır'}\n"
+        f"Anlık Fiyat: {a['price']}\n"
+        f"HTF Bias: {a['htf_bias']}\n"
+        f"Likidite Sweep: {a['sweep']}\n"
+        f"MSS: {a['mss']}\n"
+        f"CHoCH: {a['choch']}\n"
+        f"FVG: {a['fvg']}\n"
+        f"iFVG: {a['ifvg']}\n"
+        f"CISD: {a['cisd']}\n"
+        f"Premium/Discount: {a['pd_zone']}\n"
+        f"Displacement: {a['displacement']}\n"
+        f"Asia Range: {a['asia_range']}\n"
+        f"SMT: {a['smt']}\n"
+        f"True Order Block: {a['true_ob']}\n"
+        f"Skor: {a['confidence']}/100\n"
+        f"Sinyal Kalitesi: {a['signal_tier']}\n"
+        f"Killzone filtresi: {'Geçti' if a['filters']['killzone'] else 'Kaldı'}\n"
+        f"Sweep filtresi: {'Geçti' if a['filters']['sweep'] else 'Kaldı'}\n"
+        f"Yapı filtresi: {'Geçti' if a['filters']['structure'] else 'Kaldı'}\n"
+        f"Displacement filtresi: {'Geçti' if a['filters']['displacement'] else 'Kaldı'}\n"
+        f"Retest filtresi: {'Geçti' if a['filters']['retest'] else 'Kaldı'}\n"
+        f"Durum: {'Sinyal var' if a['direction'] != 'Bekle' else 'Şu an net setup yok'}\n"
+        f"Not: Bot şartlar tamam değilse sessiz kalır."
     )
+
+
+def build_signal_text(a: Dict[str, Any]) -> str:
+    return (
+        f"🚨 ANALİZ + SİNYAL RAPORU\n\n"
+        f"Varlık: {a['market']}\n"
+        f"Seans: {a['session']}\n"
+        f"Killzone: {'Evet' if a['killzone'] else 'Hayır'}\n"
+        f"Anlık Fiyat: {a['price']}\n\n"
+        f"HTF Bias: {a['htf_bias']}\n"
+        f"Likidite Sweep: {a['sweep']}\n"
+        f"MSS: {a['mss']}\n"
+        f"CHoCH: {a['choch']}\n"
+        f"FVG: {a['fvg']}\n"
+        f"iFVG: {a['ifvg']}\n"
+        f"CISD: {a['cisd']}\n"
+        f"Premium/Discount: {a['pd_zone']}\n"
+        f"Displacement: {a['displacement']}\n"
+        f"Asia Range: {a['asia_range']}\n"
+        f"SMT: {a['smt']}\n"
+        f"True Order Block: {a['true_ob']}\n\n"
+        f"İşlem Yönü: {a['direction']}\n"
+        f"Giriş: {a['entry']}\n"
+        f"Zarar Durdur: {a['sl']}\n"
+        f"Kar Al: {a['tp']}\n"
+        f"Güven Skoru: {a['confidence']}/100\n"
+        f"Sinyal Kalitesi: {a['signal_tier']}\n"
+        f"Long/Short Skor: {a['scores']['long']} / {a['scores']['short']}\n"
+        f"Killzone filtresi: {'Geçti' if a['filters']['killzone'] else 'Kaldı'}\n"
+        f"Sweep filtresi: {'Geçti' if a['filters']['sweep'] else 'Kaldı'}\n"
+        f"Yapı filtresi: {'Geçti' if a['filters']['structure'] else 'Kaldı'}\n"
+        f"Displacement filtresi: {'Geçti' if a['filters']['displacement'] else 'Kaldı'}\n"
+        f"Retest filtresi: {'Geçti' if a['filters']['retest'] else 'Kaldı'}\n\n"
+        f"⚠️ Not: Bu sinyal otomatik tarama sonucudur. Son kararı yine sen ver."
+    )
+
+
+def build_tp_text(sig: Dict[str, Any], current_price: float) -> str:
+    return (
+        f"✅ TP oldu\n\n"
+        f"Varlık: {sig['market']}\n"
+        f"Yön: {sig['direction']}\n"
+        f"Giriş: {sig['entry']}\n"
+        f"TP: {sig['tp']}\n"
+        f"Anlık Fiyat: {current_price}"
+    )
+
+
+def build_sl_text(sig: Dict[str, Any], current_price: float) -> str:
+    return (
+        f"❌ SL oldu\n\n"
+        f"Varlık: {sig['market']}\n"
+        f"Yön: {sig['direction']}\n"
+        f"Giriş: {sig['entry']}\n"
+        f"SL: {sig['sl']}\n"
+        f"Anlık Fiyat: {current_price}"
+    )
+
+
+# =========================================================
+# SIGNAL MEMORY
+# =========================================================
+def signal_key(a: Dict[str, Any]) -> str:
+    return f"{a['market']}|{a['direction']}|{a['entry']}|{a['sl']}|{a['tp']}"
 
 
 def signal_recently_sent(market: str, key: str) -> bool:
@@ -840,107 +934,25 @@ def remember_signal(market: str, key: str) -> None:
     save_state()
 
 
-def build_signal_text(a: Dict[str, Any]) -> str:
-    return (
-        f"🚨 ANALİZ + SİNYAL RAPORU\n\n"
-        f"Varlık: {a['market']}\n"
-        f"Seans: {a['session']}\n"
-        f"Killzone: {'Evet' if a['killzone'] else 'Hayır'}\n"
-        f"Anlık Fiyat: {a['price']}\n\n"
-        f"HTF Bias: {a['htf_bias']}\n"
-        f"Likidite Sweep: {a['sweep']}\n"
-        f"MSS: {a['mss']}\n"
-        f"CHoCH: {a['choch']}\n"
-        f"FVG: {a['fvg']}\n"
-        f"iFVG: {a['ifvg']}\n"
-        f"CISD: {a['cisd']}\n"
-        f"Premium/Discount: {a['pd_zone']}\n"
-        f"Displacement: {a['displacement']}\n"
-        f"Asia Range: {a['asia_range']}\n"
-        f"SMT: {a['smt']}\n"
-        f"True Order Block: {a['true_ob']}\n\n"
-        f"İşlem Yönü: {a['direction']}\n"
-        f"Giriş: {a['entry']}\n"
-        f"Zarar Durdur: {a['sl']}\n"
-        f"Kar Al: {a['tp']}\n"
-        f"Güven Skoru: {a['confidence']}/100\n"
-        f"Long/Short Skor: {a['scores']['long']} / {a['scores']['short']}\n"
-        f"Killzone filtresi: {'Geçti' if a['filters']['killzone_required'] else 'Kaldı'}\n"
-        f"Sweep filtresi: {'Geçti' if a['filters']['sweep_required'] else 'Kaldı'}\n"
-        f"Displacement filtresi: {'Geçti' if a['filters']['displacement_required'] else 'Kaldı'}\n"
-        f"Retest filtresi: {'Geçti' if a['filters']['entry_retest_required'] else 'Kaldı'}\n\n"
-        f"⚠️ Not: Bu sinyal otomatik profesyonel tarama sonucudur. Son kararı yine sen ver."
-    )
-
-
-def build_manual_text(a: Dict[str, Any]) -> str:
-    return (
-        f"📋 Manuel analiz sonucu\n\n"
-        f"Varlık: {a['market']}\n"
-        f"Seans: {a['session']}\n"
-        f"Killzone: {'Evet' if a['killzone'] else 'Hayır'}\n"
-        f"Anlık Fiyat: {a['price']}\n"
-        f"HTF Bias: {a['htf_bias']}\n"
-        f"Likidite Sweep: {a['sweep']}\n"
-        f"MSS: {a['mss']}\n"
-        f"CHoCH: {a['choch']}\n"
-        f"FVG: {a['fvg']}\n"
-        f"iFVG: {a['ifvg']}\n"
-        f"CISD: {a['cisd']}\n"
-        f"Premium/Discount: {a['pd_zone']}\n"
-        f"Displacement: {a['displacement']}\n"
-        f"Asia Range: {a['asia_range']}\n"
-        f"SMT: {a['smt']}\n"
-        f"True Order Block: {a['true_ob']}\n"
-        f"Skor: {a['confidence']}/100\n"
-        f"Killzone filtresi: {'Geçti' if a['filters']['killzone_required'] else 'Kaldı'}\n"
-        f"Sweep filtresi: {'Geçti' if a['filters']['sweep_required'] else 'Kaldı'}\n"
-        f"Displacement filtresi: {'Geçti' if a['filters']['displacement_required'] else 'Kaldı'}\n"
-        f"Retest filtresi: {'Geçti' if a['filters']['entry_retest_required'] else 'Kaldı'}\n"
-        f"Durum: Şu an net setup yok.\n"
-        f"Not: Bot sessiz kalır."
-    )
-
-
-def build_tp_text(sig: Dict[str, Any], current_price: float) -> str:
-    return (
-        f"✅ TP oldu\n\n"
-        f"Varlık: {sig['market']}\n"
-        f"Yön: {sig['direction']}\n"
-        f"Giriş: {sig['entry']}\n"
-        f"TP: {sig['tp']}\n"
-        f"Anlık Fiyat: {current_price}"
-    )
-
-
-def build_sl_text(sig: Dict[str, Any], current_price: float) -> str:
-    return (
-        f"❌ SL oldu\n\n"
-        f"Varlık: {sig['market']}\n"
-        f"Yön: {sig['direction']}\n"
-        f"Giriş: {sig['entry']}\n"
-        f"SL: {sig['sl']}\n"
-        f"Anlık Fiyat: {current_price}"
-    )
-
 # =========================================================
 # ACTIVE SIGNAL TRACKER
 # =========================================================
-def check_active_signals() -> None:
+def check_active_signals(cache: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None) -> None:
     active = STATE["active_signals"]
-
     if not isinstance(active, dict):
         STATE["active_signals"] = {}
         active = STATE["active_signals"]
 
+    if cache is None:
+        cache = build_scan_cache(force_refresh=False)
+
     remove_list: List[str] = []
 
     for market, sig in active.items():
-        df_5m = get_hist(market, Interval.in_5_minute, 5)
-        if df_5m is None:
+        if market not in cache:
             continue
 
-        current_price = round_price(market, last_close(df_5m))
+        current_price = round_price(market, df_last_close(cache[market]["5m"]))
         if current_price is None:
             continue
 
@@ -968,30 +980,25 @@ def check_active_signals() -> None:
     if remove_list:
         save_state()
 
+
 # =========================================================
-# AUTO SCANNER
+# SCANNER LOOP
 # =========================================================
 def scanner_loop() -> None:
     while True:
         try:
-            check_active_signals()
-
-            if len(STATE["active_signals"]) > MAX_ACTIVE_SIGNALS:
-                time.sleep(SCAN_INTERVAL_SECONDS)
-                continue
+            cache = build_scan_cache(force_refresh=True)
+            check_active_signals(cache=cache)
 
             for market in MARKETS.keys():
                 if market in STATE["active_signals"]:
                     continue
 
-                a = analyze_market(market)
+                a = analyze_market(market, cache=cache)
                 if a is None:
                     continue
 
                 if a["direction"] == "Bekle":
-                    continue
-
-                if a["confidence"] < MIN_SIGNAL_CONFIDENCE:
                     continue
 
                 key = signal_key(a)
@@ -1014,14 +1021,20 @@ def scanner_loop() -> None:
                 }
 
                 remember_signal(market, key)
-                save_state()
+                time.sleep(0.25)
 
             STATE["last_scan_at"] = utc_now().replace(tzinfo=None).isoformat()
             save_state()
+
+            # RAM temizliği
+            cache.clear()
+            gc.collect()
             time.sleep(SCAN_INTERVAL_SECONDS)
 
         except Exception:
+            gc.collect()
             time.sleep(SCAN_INTERVAL_SECONDS)
+
 
 # =========================================================
 # ROUTES
@@ -1030,7 +1043,7 @@ def scanner_loop() -> None:
 def home():
     return jsonify({
         "ok": True,
-        "status": "Trade Konseyi PRO aktif",
+        "status": "Trade Konseyi optimize sürüm aktif",
         "markets": list(MARKETS.keys()),
         "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
         "active_signals_count": len(STATE["active_signals"]),
@@ -1050,23 +1063,14 @@ def status():
     return jsonify({"ok": True, "telegram_result": tg})
 
 
-@app.route("/test", methods=["GET"])
-def test():
-    data = {}
-    for market in MARKETS.keys():
-        a = analyze_market(market)
-        data[market] = a if a else {"error": "veri alınamadı"}
-    return jsonify({"ok": True, "data": data})
-
-
 @app.route("/manual/<market>", methods=["GET"])
 def manual_market(market: str):
     market = market.upper()
-
     if market not in MARKETS:
         return jsonify({"ok": False, "error": "Geçersiz market"}), 400
 
-    a = analyze_market(market)
+    cache = build_scan_cache(force_refresh=True)
+    a = analyze_market(market, cache=cache)
     if a is None:
         return jsonify({"ok": False, "error": "Veri alınamadı"}), 500
 
@@ -1075,24 +1079,22 @@ def manual_market(market: str):
     else:
         tg = send_telegram_message(build_signal_text(a))
 
+    cache.clear()
+    gc.collect()
     return jsonify({"ok": True, "analysis": a, "telegram_result": tg})
 
 
 @app.route("/manual-all", methods=["GET"])
 def manual_all():
+    cache = build_scan_cache(force_refresh=True)
     results = []
     sent_count = 0
 
     for market in MARKETS.keys():
         try:
-            a = analyze_market(market)
-
+            a = analyze_market(market, cache=cache)
             if a is None:
-                results.append({
-                    "market": market,
-                    "status": "error",
-                    "detail": "Veri alınamadı"
-                })
+                results.append({"market": market, "status": "error", "detail": "Veri alınamadı"})
                 continue
 
             if a["direction"] == "Bekle":
@@ -1106,20 +1108,20 @@ def manual_all():
                 "status": "sent",
                 "direction": a["direction"],
                 "confidence": a["confidence"],
-                "telegram_ok": tg.get("ok", False) if isinstance(tg, dict) else False
+                "telegram_ok": tg.get("ok", False) if isinstance(tg, dict) else False,
             })
+            time.sleep(0.25)
 
         except Exception as e:
-            results.append({
-                "market": market,
-                "status": "error",
-                "detail": str(e)
-            })
+            results.append({"market": market, "status": "error", "detail": str(e)})
+
+    cache.clear()
+    gc.collect()
 
     return jsonify({
         "ok": True,
         "message": f"{sent_count} market Telegram'a gönderildi.",
-        "results": results
+        "results": results,
     })
 
 
@@ -1127,44 +1129,6 @@ def manual_all():
 def active_signals():
     return jsonify({"ok": True, "active_signals": STATE["active_signals"]})
 
-
-@app.route("/telegram-webhook", methods=["POST"])
-def telegram_webhook():
-    data = request.get_json(silent=True) or {}
-    message = data.get("message", {})
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-
-    if not chat_id or not is_allowed_chat(chat_id):
-        return jsonify({"ok": True})
-
-    text = message.get("text", "").strip()
-
-    if text == "/start":
-        send_telegram_message("✅ Trade Konseyi PRO aktif. Yetkili kullanıcı doğrulandı.")
-
-    elif text == "/markets":
-        send_telegram_message("İzlenen marketler:\n" + "\n".join(MARKETS.keys()))
-
-    elif text == "/status":
-        send_telegram_message(
-            f"✅ Sistem durumu\n\n"
-            f"Seans: {session_info()['session']}\n"
-            f"Aktif sinyal sayısı: {len(STATE['active_signals'])}\n"
-            f"İzlenen market sayısı: {len(MARKETS)}"
-        )
-
-    elif text.lower().startswith("/manual "):
-        market = text.lower().replace("/manual ", "").upper()
-        if market in MARKETS:
-            a = analyze_market(market)
-            if a:
-                if a["direction"] == "Bekle":
-                    send_telegram_message(build_manual_text(a))
-                else:
-                    send_telegram_message(build_signal_text(a))
-
-    return jsonify({"ok": True})
 
 # =========================================================
 # STARTUP
