@@ -6,6 +6,7 @@ import gc
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple, List
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import requests
@@ -24,9 +25,8 @@ TV_PASSWORD = os.getenv("TV_PASSWORD", "").strip()
 # =========================================================
 # SETTINGS
 # =========================================================
-SCAN_INTERVAL_SECONDS = 30
+SCAN_INTERVAL_SECONDS = 60
 MIN_SIGNAL_CONFIDENCE = 74
-STRONG_SIGNAL_CONFIDENCE = 82
 SIGNAL_COOLDOWN_MINUTES = 45
 
 DEFAULT_SL_ATR_MULT = 1.20
@@ -34,19 +34,22 @@ DEFAULT_TP_ATR_MULT = 2.20
 
 STATE_FILE = "bot_state.json"
 
+# News filter
+NEWS_BLOCK_BEFORE_MIN = 30
+NEWS_BLOCK_AFTER_MIN = 15
+NEWS_CACHE_MINUTES = 15
+
 # =========================================================
 # MARKETS
 # =========================================================
-MARKETS: Dict[str, Dict[str, str]] = {
-    "EURUSD": {"symbol": "EURUSD", "exchange": "OANDA"},
-    "GBPUSD": {"symbol": "GBPUSD", "exchange": "OANDA"},
-    "USDJPY": {"symbol": "USDJPY", "exchange": "OANDA"},
-    "XAUUSD": {"symbol": "XAUUSD", "exchange": "OANDA"},
-    "XAGUSD": {"symbol": "XAGUSD", "exchange": "OANDA"},
-    "NASDAQ": {"symbol": "US100", "exchange": "CAPITALCOM"},
-    "US30": {"symbol": "US30", "exchange": "CAPITALCOM"},
-    "SPX500": {"symbol": "US500", "exchange": "CAPITALCOM"},
-    "DXY": {"symbol": "DXY", "exchange": "TVC"},
+MARKETS: Dict[str, Dict[str, Any]] = {
+    "EURUSD": {"symbol": "EURUSD", "exchange": "OANDA", "news": ["EUR", "USD"]},
+    "GBPUSD": {"symbol": "GBPUSD", "exchange": "OANDA", "news": ["GBP", "USD"]},
+    "DXY": {"symbol": "DXY", "exchange": "TVC", "news": ["USD"]},
+    "XAUUSD": {"symbol": "XAUUSD", "exchange": "OANDA", "news": ["USD"]},
+    "NASDAQ": {"symbol": "US100", "exchange": "CAPITALCOM", "news": ["USD"]},
+    "SPX500": {"symbol": "US500", "exchange": "CAPITALCOM", "news": ["USD"]},
+    "USOIL": {"symbol": "USOIL", "exchange": "CAPITALCOM", "news": ["USD"]},
 }
 
 SMT_PAIRS = {
@@ -71,8 +74,10 @@ STATE: Dict[str, Any] = {
 
 _last_scan_data_cache: Dict[str, Dict[str, pd.DataFrame]] = {}
 _last_scan_data_ts: Optional[datetime] = None
-CACHE_TTL_SECONDS = 20
+CACHE_TTL_SECONDS = 25
 
+_news_cache: List[Dict[str, Any]] = []
+_news_cache_ts: Optional[datetime] = None
 
 # =========================================================
 # GENERAL
@@ -84,7 +89,7 @@ def utc_now() -> datetime:
 def round_price(market: str, value: Optional[float]) -> Optional[float]:
     if value is None:
         return None
-    if market in ["EURUSD", "GBPUSD", "USDJPY"]:
+    if market in ["EURUSD", "GBPUSD"]:
         return round(float(value), 5)
     return round(float(value), 2)
 
@@ -184,7 +189,6 @@ def near_zone(price: Optional[float], zone: Optional[Tuple[float, float]], toler
     tol = width * tolerance_ratio
     return (lo - tol) <= price <= (hi + tol)
 
-
 # =========================================================
 # TELEGRAM
 # =========================================================
@@ -213,7 +217,6 @@ def send_telegram_message(text: str, reply_to_message_id: Optional[int] = None) 
 
     return telegram_api("sendMessage", payload)
 
-
 # =========================================================
 # STATE
 # =========================================================
@@ -238,7 +241,6 @@ def save_state() -> None:
     except Exception:
         pass
 
-
 # =========================================================
 # TV INIT
 # =========================================================
@@ -253,7 +255,6 @@ def init_tv() -> bool:
     except Exception:
         tv = None
         return False
-
 
 # =========================================================
 # DATA FETCH
@@ -272,11 +273,9 @@ def get_hist_raw(symbol: str, exchange: str, interval: Interval, n_bars: int) ->
         if "datetime" in df.columns:
             df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
 
-        # sadece gerekli kolonları tut
         keep_cols = [c for c in ["datetime", "open", "high", "low", "close", "volume"] if c in df.columns]
         df = df[keep_cols]
 
-        # tip küçültme
         for c in ["open", "high", "low", "close", "volume"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
@@ -327,6 +326,109 @@ def build_scan_cache(force_refresh: bool = False) -> Dict[str, Dict[str, pd.Data
     gc.collect()
     return cache
 
+# =========================================================
+# NEWS FILTER
+# =========================================================
+def parse_ff_datetime(date_str: str, time_str: str) -> Optional[datetime]:
+    if not date_str or not time_str:
+        return None
+
+    date_str = date_str.strip()
+    time_str = time_str.strip()
+
+    if time_str.lower() in {"all day", "tentative", ""}:
+        return None
+
+    patterns = [
+        "%m-%d-%Y %I:%M%p",
+        "%Y-%m-%d %I:%M%p",
+        "%m-%d-%Y %H:%M",
+        "%Y-%m-%d %H:%M",
+    ]
+
+    for fmt in patterns:
+        try:
+            dt = datetime.strptime(f"{date_str} {time_str}", fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+    return None
+
+
+def fetch_forex_factory_news() -> List[Dict[str, Any]]:
+    global _news_cache, _news_cache_ts
+
+    now = utc_now()
+    if (
+        _news_cache_ts is not None
+        and (now - _news_cache_ts) < timedelta(minutes=NEWS_CACHE_MINUTES)
+        and _news_cache
+    ):
+        return _news_cache
+
+    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+    events: List[Dict[str, Any]] = []
+
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+
+        root = ET.fromstring(r.text)
+
+        for item in root.findall(".//event"):
+            country = (item.findtext("country") or "").strip().upper()
+            title = (item.findtext("title") or "").strip()
+            date_str = (item.findtext("date") or "").strip()
+            time_str = (item.findtext("time") or "").strip()
+            impact = (item.findtext("impact") or "").strip().lower()
+
+            if impact not in {"high", "medium", "high impact expected", "medium impact expected"}:
+                continue
+
+            dt = parse_ff_datetime(date_str, time_str)
+            if dt is None:
+                continue
+
+            events.append({
+                "country": country,
+                "title": title,
+                "impact": impact,
+                "datetime": dt,
+            })
+
+        _news_cache = events
+        _news_cache_ts = now
+        return events
+
+    except Exception:
+        return _news_cache if _news_cache else []
+
+
+def market_news_block(market: str) -> Dict[str, Any]:
+    relevant = set(MARKETS[market]["news"])
+    events = fetch_forex_factory_news()
+    now = utc_now()
+
+    before_delta = timedelta(minutes=NEWS_BLOCK_BEFORE_MIN)
+    after_delta = timedelta(minutes=NEWS_BLOCK_AFTER_MIN)
+
+    blocking_events = []
+    for e in events:
+        if e["country"] not in relevant:
+            continue
+
+        if (e["datetime"] - before_delta) <= now <= (e["datetime"] + after_delta):
+            blocking_events.append(e)
+
+    if blocking_events:
+        titles = [f"{e['country']} {e['title']}" for e in blocking_events[:3]]
+        return {
+            "blocked": True,
+            "reason": " | ".join(titles)
+        }
+
+    return {"blocked": False, "reason": "Yok"}
 
 # =========================================================
 # ANALYSIS PIECES
@@ -605,7 +707,6 @@ def detect_smt(primary_df: pd.DataFrame, comparison_df: pd.DataFrame) -> Dict[st
 
     return {"label": "Yok", "type": None}
 
-
 # =========================================================
 # ANALYSIS ENGINE
 # =========================================================
@@ -625,6 +726,8 @@ def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame
         return None
 
     sess = session_info()
+    news = market_news_block(market)
+
     htf_bias = detect_htf_bias(df_1h, df_15m)
     sweep = detect_liquidity_sweep(df_5m)
     mss = detect_mss(df_5m)
@@ -642,104 +745,128 @@ def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame
     if pair and pair in data:
         smt = detect_smt(df_5m, data[pair]["5m"])
 
-    # scores
-    long_score = 0
-    short_score = 0
-
-    if htf_bias == "Yükseliş":
-        long_score += 20
-    elif htf_bias == "Düşüş":
-        short_score += 20
-
-    if sweep["type"] == "bullish":
-        long_score += 18
-    elif sweep["type"] == "bearish":
-        short_score += 18
-
-    if asia["sweep"] == "asia_low_swept":
-        long_score += 10
-    elif asia["sweep"] == "asia_high_swept":
-        short_score += 10
-
-    if mss["type"] == "bullish":
-        long_score += 18
-    elif mss["type"] == "bearish":
-        short_score += 18
-
-    if choch["type"] == "bullish":
-        long_score += 10
-    elif choch["type"] == "bearish":
-        short_score += 10
-
-    if displacement["strong"]:
-        long_score += 8
-        short_score += 8
-
-    if fvg["type"] == "bullish":
-        long_score += 8
-    elif fvg["type"] == "bearish":
-        short_score += 8
-
-    if ifvg["type"] == "bullish":
-        long_score += 8
-    elif ifvg["type"] == "bearish":
-        short_score += 8
-
-    if cisd["type"] == "bullish":
-        long_score += 10
-    elif cisd["type"] == "bearish":
-        short_score += 10
-
-    if pd_zone == "Discount":
-        long_score += 8
-    elif pd_zone == "Premium":
-        short_score += 8
-
-    if ob["type"] == "bullish" and near_zone(price, ob["zone"]):
-        long_score += 10
-    elif ob["type"] == "bearish" and near_zone(price, ob["zone"]):
-        short_score += 10
-
-    if sess["killzone"]:
-        long_score += 5
-        short_score += 5
-
-    if smt["type"] == "bullish":
-        long_score += 7
-    elif smt["type"] == "bearish":
-        short_score += 7
-
-    candidate_direction = "Bekle"
-    confidence = max(long_score, short_score)
-
-    if long_score >= MIN_SIGNAL_CONFIDENCE and long_score > short_score:
-        candidate_direction = "LONG"
-        confidence = long_score
-    elif short_score >= MIN_SIGNAL_CONFIDENCE and short_score > long_score:
-        candidate_direction = "SHORT"
-        confidence = short_score
-
-    # hard filters
+    # ------------------------------
+    # REQUIRED
+    # ------------------------------
     killzone_pass = sess["killzone"]
     sweep_pass_long = (sweep["type"] == "bullish") or (asia["sweep"] == "asia_low_swept")
     sweep_pass_short = (sweep["type"] == "bearish") or (asia["sweep"] == "asia_high_swept")
     structure_pass_long = (mss["type"] == "bullish") or (choch["type"] == "bullish")
     structure_pass_short = (mss["type"] == "bearish") or (choch["type"] == "bearish")
 
+    # ------------------------------
+    # STRONG CONFIRMATION
+    # ------------------------------
+    ob_proximity_long = near_zone(price, ob["zone"]) if ob["type"] == "bullish" else False
+    ob_proximity_short = near_zone(price, ob["zone"]) if ob["type"] == "bearish" else False
+
+    smt_long = smt["type"] == "bullish"
+    smt_short = smt["type"] == "bearish"
+
+    # ------------------------------
+    # OPTIONAL
+    # ------------------------------
     retest_pass_long = near_zone(price, ob["zone"]) or near_zone(price, fvg["zone"])
     retest_pass_short = near_zone(price, ob["zone"]) or near_zone(price, fvg["zone"])
 
+    long_score = 0
+    short_score = 0
+
+    if htf_bias == "Yükseliş":
+        long_score += 25
+    elif htf_bias == "Düşüş":
+        short_score += 25
+
+    if sweep_pass_long:
+        long_score += 20
+    if sweep_pass_short:
+        short_score += 20
+
+    if structure_pass_long:
+        long_score += 20
+    if structure_pass_short:
+        short_score += 20
+
+    if killzone_pass:
+        long_score += 10
+        short_score += 10
+
+    # strong confirmation
+    if smt_long:
+        long_score += 10
+    if smt_short:
+        short_score += 10
+
+    if ob_proximity_long:
+        long_score += 10
+    if ob_proximity_short:
+        short_score += 10
+
+    # optional
+    if displacement["strong"]:
+        long_score += 5
+        short_score += 5
+
+    if fvg["type"] == "bullish":
+        long_score += 4
+    elif fvg["type"] == "bearish":
+        short_score += 4
+
+    if ifvg["type"] == "bullish":
+        long_score += 4
+    elif ifvg["type"] == "bearish":
+        short_score += 4
+
+    if cisd["type"] == "bullish":
+        long_score += 5
+    elif cisd["type"] == "bearish":
+        short_score += 5
+
+    if pd_zone == "Discount":
+        long_score += 4
+    elif pd_zone == "Premium":
+        short_score += 4
+
+    if retest_pass_long:
+        long_score += 4
+    if retest_pass_short:
+        short_score += 4
+
+    # direction
     direction = "Bekle"
+    confidence = max(long_score, short_score)
 
-    if candidate_direction == "LONG":
-        if htf_bias == "Yükseliş" and killzone_pass and sweep_pass_long and structure_pass_long:
+    hard_long = (htf_bias == "Yükseliş") and killzone_pass and sweep_pass_long and structure_pass_long
+    hard_short = (htf_bias == "Düşüş") and killzone_pass and sweep_pass_short and structure_pass_short
+
+    if not news["blocked"]:
+        if hard_long and long_score >= MIN_SIGNAL_CONFIDENCE and long_score > short_score:
             direction = "LONG"
-
-    elif candidate_direction == "SHORT":
-        if htf_bias == "Düşüş" and killzone_pass and sweep_pass_short and structure_pass_short:
+        elif hard_short and short_score >= MIN_SIGNAL_CONFIDENCE and short_score > long_score:
             direction = "SHORT"
 
-    # entry / sl / tp
+    # tier
+    signal_tier = "Yok"
+    if direction == "LONG":
+        strong_hits = int(smt_long) + int(ob_proximity_long)
+        optional_hits = int(displacement["strong"]) + int(retest_pass_long) + int(fvg["type"] == "bullish") + int(ifvg["type"] == "bullish") + int(cisd["type"] == "bullish")
+        if strong_hits >= 1 and optional_hits >= 1:
+            signal_tier = "A++"
+        elif strong_hits >= 1:
+            signal_tier = "A+"
+        else:
+            signal_tier = "A"
+
+    elif direction == "SHORT":
+        strong_hits = int(smt_short) + int(ob_proximity_short)
+        optional_hits = int(displacement["strong"]) + int(retest_pass_short) + int(fvg["type"] == "bearish") + int(ifvg["type"] == "bearish") + int(cisd["type"] == "bearish")
+        if strong_hits >= 1 and optional_hits >= 1:
+            signal_tier = "A++"
+        elif strong_hits >= 1:
+            signal_tier = "A+"
+        else:
+            signal_tier = "A"
+
     ar = avg_range(df_5m, 14)
     if ar is None:
         return None
@@ -760,18 +887,6 @@ def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame
     ob_text = ob["label"]
     if ob["zone"] is not None:
         ob_text = f"{ob['label']} ({round_price(market, ob['zone'][0])} - {round_price(market, ob['zone'][1])})"
-
-    signal_tier = "Yok"
-    if direction != "Bekle":
-        extra_strength = 0
-        if displacement["strong"]:
-            extra_strength += 1
-        if (direction == "LONG" and retest_pass_long) or (direction == "SHORT" and retest_pass_short):
-            extra_strength += 1
-        if confidence >= STRONG_SIGNAL_CONFIDENCE and extra_strength >= 1:
-            signal_tier = "A+"
-        else:
-            signal_tier = "Standart"
 
     return {
         "market": market,
@@ -799,13 +914,16 @@ def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame
         "scores": {"long": long_score, "short": short_score},
         "filters": {
             "killzone": killzone_pass,
-            "sweep": sweep_pass_long if direction == "LONG" else sweep_pass_short if direction == "SHORT" else False,
-            "structure": structure_pass_long if direction == "LONG" else structure_pass_short if direction == "SHORT" else False,
+            "sweep": sweep_pass_long if direction == "LONG" else sweep_pass_short if direction == "SHORT" else (sweep_pass_long or sweep_pass_short),
+            "structure": structure_pass_long if direction == "LONG" else structure_pass_short if direction == "SHORT" else (structure_pass_long or structure_pass_short),
+            "smt": smt_long if direction == "LONG" else smt_short if direction == "SHORT" else (smt_long or smt_short),
+            "ob_proximity": ob_proximity_long if direction == "LONG" else ob_proximity_short if direction == "SHORT" else (ob_proximity_long or ob_proximity_short),
             "displacement": displacement["strong"],
-            "retest": retest_pass_long if direction == "LONG" else retest_pass_short if direction == "SHORT" else False,
+            "retest": retest_pass_long if direction == "LONG" else retest_pass_short if direction == "SHORT" else (retest_pass_long or retest_pass_short),
+            "news": not news["blocked"],
+            "news_reason": news["reason"],
         },
     }
-
 
 # =========================================================
 # TEXT BUILDERS
@@ -834,8 +952,12 @@ def build_manual_text(a: Dict[str, Any]) -> str:
         f"Killzone filtresi: {'Geçti' if a['filters']['killzone'] else 'Kaldı'}\n"
         f"Sweep filtresi: {'Geçti' if a['filters']['sweep'] else 'Kaldı'}\n"
         f"Yapı filtresi: {'Geçti' if a['filters']['structure'] else 'Kaldı'}\n"
+        f"SMT teyidi: {'Var' if a['filters']['smt'] else 'Yok'}\n"
+        f"OB proximity teyidi: {'Var' if a['filters']['ob_proximity'] else 'Yok'}\n"
         f"Displacement filtresi: {'Geçti' if a['filters']['displacement'] else 'Kaldı'}\n"
         f"Retest filtresi: {'Geçti' if a['filters']['retest'] else 'Kaldı'}\n"
+        f"News filtresi: {'Geçti' if a['filters']['news'] else 'Kaldı'}\n"
+        f"News nedeni: {a['filters']['news_reason']}\n"
         f"Durum: {'Sinyal var' if a['direction'] != 'Bekle' else 'Şu an net setup yok'}\n"
         f"Not: Bot şartlar tamam değilse sessiz kalır."
     )
@@ -870,8 +992,12 @@ def build_signal_text(a: Dict[str, Any]) -> str:
         f"Killzone filtresi: {'Geçti' if a['filters']['killzone'] else 'Kaldı'}\n"
         f"Sweep filtresi: {'Geçti' if a['filters']['sweep'] else 'Kaldı'}\n"
         f"Yapı filtresi: {'Geçti' if a['filters']['structure'] else 'Kaldı'}\n"
+        f"SMT teyidi: {'Var' if a['filters']['smt'] else 'Yok'}\n"
+        f"OB proximity teyidi: {'Var' if a['filters']['ob_proximity'] else 'Yok'}\n"
         f"Displacement filtresi: {'Geçti' if a['filters']['displacement'] else 'Kaldı'}\n"
-        f"Retest filtresi: {'Geçti' if a['filters']['retest'] else 'Kaldı'}\n\n"
+        f"Retest filtresi: {'Geçti' if a['filters']['retest'] else 'Kaldı'}\n"
+        f"News filtresi: {'Geçti' if a['filters']['news'] else 'Kaldı'}\n"
+        f"News nedeni: {a['filters']['news_reason']}\n\n"
         f"⚠️ Not: Bu sinyal otomatik tarama sonucudur. Son kararı yine sen ver."
     )
 
@@ -896,7 +1022,6 @@ def build_sl_text(sig: Dict[str, Any], current_price: float) -> str:
         f"SL: {sig['sl']}\n"
         f"Anlık Fiyat: {current_price}"
     )
-
 
 # =========================================================
 # SIGNAL MEMORY
@@ -932,7 +1057,6 @@ def remember_signal(market: str, key: str) -> None:
         "ts": utc_now().replace(tzinfo=None).isoformat()
     }
     save_state()
-
 
 # =========================================================
 # ACTIVE SIGNAL TRACKER
@@ -980,7 +1104,6 @@ def check_active_signals(cache: Optional[Dict[str, Dict[str, pd.DataFrame]]] = N
     if remove_list:
         save_state()
 
-
 # =========================================================
 # SCANNER LOOP
 # =========================================================
@@ -1026,7 +1149,6 @@ def scanner_loop() -> None:
             STATE["last_scan_at"] = utc_now().replace(tzinfo=None).isoformat()
             save_state()
 
-            # RAM temizliği
             cache.clear()
             gc.collect()
             time.sleep(SCAN_INTERVAL_SECONDS)
@@ -1034,7 +1156,6 @@ def scanner_loop() -> None:
         except Exception:
             gc.collect()
             time.sleep(SCAN_INTERVAL_SECONDS)
-
 
 # =========================================================
 # ROUTES
@@ -1128,7 +1249,6 @@ def manual_all():
 @app.route("/active-signals", methods=["GET"])
 def active_signals():
     return jsonify({"ok": True, "active_signals": STATE["active_signals"]})
-
 
 # =========================================================
 # STARTUP
