@@ -537,14 +537,24 @@ def analyze_symbol(
     raw_data_map: Optional[Dict[str, Dict[str, Any]]] = None,
     market_candles: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Optional[Dict[str, Any]]:
-    raw = fetch_twelvedata_series(symbol)
-    if not raw:
-        return None
+    raw = None
 
+if raw_data_map and symbol in raw_data_map:
+    raw = raw_data_map[symbol]
+else:
+    raw = fetch_twelvedata_series(symbol)
+
+if not raw:
+    return None
+
+if market_candles and symbol in market_candles:
+    candles = market_candles[symbol]
+else:
     candles = build_candles(raw)
-    if len(candles) < 20:
-        print(f"{symbol} için yeterli mum yok.")
-        return None
+
+if len(candles) < 20:
+    print(f"{symbol}  için yeterli mum yok.")
+    return None
 
     last_price = candles[-1]["close"]
 
@@ -558,7 +568,7 @@ def analyze_symbol(
 
     killzone_label = get_killzone_label()
     killzone_active = is_killzone_active()
-    smt = detect_smt_placeholder(symbol)
+    smt = detect_smt_for_symbol(symbol, market_candles or {})
 
     direction = "YOK"
 
