@@ -23,8 +23,9 @@ PORT = int(os.getenv("PORT", "10000"))
 SCAN_INTERVAL_SECONDS = 120
 TIMEFRAME = "15min"
 OUTPUTSIZE = 60
+MIN_SIGNAL_SCORE = 75
+SIGNAL_COOLDOWN_MINUTES = 45
 
-# İzlenecek pariteler
 MARKETS = [
     "EUR/USD",
     "GBP/USD",
@@ -38,11 +39,11 @@ STATE: Dict[str, Any] = {
     "last_scan_at": None,
     "last_results": {},
     "scanner_started": False,
+    "active_signals": {},
 }
 
 scan_lock = threading.Lock()
 scanner_started_once = False
-
 
 # =========================================================
 # UTILS
@@ -56,6 +57,20 @@ def safe_float(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def minutes_since(iso_dt: Optional[str]) -> float:
+    if not iso_dt:
+        return 999999.0
+
+    try:
+        dt = datetime.fromisoformat(iso_dt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - dt
+        return delta.total_seconds() / 60.0
+    except Exception:
+        return 999999.0
 
 
 def send_telegram_message(text: str) -> bool:
@@ -72,7 +87,12 @@ def send_telegram_message(text: str) -> bool:
     try:
         response = requests.post(url, json=payload, timeout=20)
         print(f"Telegram status: {response.status_code}")
-        return response.status_code == 200
+
+        if response.status_code != 200:
+            print(f"Telegram response: {response.text}")
+            return False
+
+        return True
     except Exception as e:
         print(f"Telegram gönderim hatası: {e}")
         return False
@@ -100,7 +120,7 @@ def fetch_twelvedata_series(symbol: str) -> Optional[Dict[str, Any]]:
         data = response.json()
 
         if response.status_code != 200:
-            print(f"{symbol} HTTP hata: {response.status_code}")
+            print(f"{symbol} HTTP hata: {response.status_code} - {response.text}")
             return None
 
         if data.get("status") == "error":
@@ -108,7 +128,7 @@ def fetch_twelvedata_series(symbol: str) -> Optional[Dict[str, Any]]:
             return None
 
         if "values" not in data or not data["values"]:
-            print(f"{symbol} veri boş.")
+            print(f"{symbol} veri boş geldi.")
             return None
 
         return data
@@ -119,7 +139,7 @@ def fetch_twelvedata_series(symbol: str) -> Optional[Dict[str, Any]]:
 
 
 # =========================================================
-# ANALYSIS
+# ANALYSIS HELPERS
 # =========================================================
 def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
     values = raw.get("values", [])
@@ -142,6 +162,7 @@ def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
             "close": c,
         })
 
+    # TwelveData genelde en yeniyi üstte verir, analiz için terse çeviriyoruz
     candles.reverse()
     return candles
 
@@ -165,7 +186,7 @@ def detect_choch_like(candles: List[Dict[str, Any]]) -> str:
     if len(candles) < 4:
         return "Yok"
 
-    a, b, c, d = candles[-4], candles[-3], candles[-2], candles[-1]
+    _, b, _, d = candles[-4], candles[-3], candles[-2], candles[-1]
 
     if d["close"] > b["high"]:
         return "Bullish CHoCH"
@@ -243,7 +264,7 @@ def detect_fvg(candles: List[Dict[str, Any]]) -> str:
     if len(candles) < 3:
         return "Yok"
 
-    a, b, c = candles[-3], candles[-2], candles[-1]
+    a, _, c = candles[-3], candles[-2], candles[-1]
 
     if c["low"] > a["high"]:
         return "Bullish FVG"
@@ -259,7 +280,7 @@ def score_signal(
     choch: str,
     fvg: str,
     displacement: str,
-    premium_discount: str
+    premium_discount: str,
 ) -> Dict[str, Any]:
     long_score = 0
     short_score = 0
@@ -362,6 +383,7 @@ def analyze_symbol(symbol: str) -> Optional[Dict[str, Any]]:
 
     candles = build_candles(raw)
     if len(candles) < 20:
+        print(f"{symbol} yeterli candle yok.")
         return None
 
     last_price = candles[-1]["close"]
@@ -406,7 +428,6 @@ def analyze_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         "last_candle_time": candles[-1]["datetime"],
     }
 
-
 def format_signal_message(result: Dict[str, Any]) -> str:
     entry = f"{result['entry']:.5f}" if result["entry"] is not None else "Yok"
     sl = f"{result['sl']:.5f}" if result["sl"] is not None else "Yok"
@@ -434,6 +455,34 @@ def format_signal_message(result: Dict[str, Any]) -> str:
     )
 
 
+def should_send_signal(result: Dict[str, Any]) -> bool:
+    symbol = result["symbol"]
+    direction = result["direction"]
+    score = result["score"]
+    quality = result["quality"]
+
+    if direction == "YOK":
+        return False
+
+    if score < MIN_SIGNAL_SCORE:
+        return False
+
+    if quality not in ("A", "A+"):
+        return False
+
+    active = STATE["active_signals"].get(symbol)
+    if not active:
+        return True
+
+    same_direction = active.get("direction") == direction
+    cooldown_ok = minutes_since(active.get("sent_at")) >= SIGNAL_COOLDOWN_MINUTES
+
+    if same_direction and not cooldown_ok:
+        return False
+
+    return True
+
+
 # =========================================================
 # SCANNER
 # =========================================================
@@ -454,27 +503,47 @@ def scan_once() -> Dict[str, Any]:
                     continue
 
                 results[symbol] = {"ok": True, "result": result}
+                STATE["last_results"][symbol] = result
+
                 print(f"{symbol} -> yön: {result['direction']}, skor: {result['score']}")
 
-                if result["direction"] != "YOK" and result["score"] >= MIN_SIGNAL_SCORE:
+                if should_send_signal(result):
                     msg = format_signal_message(result)
-                    send_telegram_message(msg)
+                    sent = send_telegram_message(msg)
+
+                    if sent:
+                        STATE["active_signals"][symbol] = {
+                            "direction": result["direction"],
+                            "score": result["score"],
+                            "sent_at": now_utc_iso(),
+                            "entry": result["entry"],
+                            "sl": result["sl"],
+                            "tp": result["tp"],
+                        }
+                        print(f"{symbol} sinyal gönderildi.")
+                    else:
+                        print(f"{symbol} sinyal gönderilemedi.")
+                else:
+                    print(f"{symbol} için sinyal yok.")
 
             except Exception as e:
                 results[symbol] = {"ok": False, "error": str(e)}
                 print(f"{symbol} scan hatası: {e}")
 
-        STATE["last_results"] = results
         print("Tarama bitti.")
         return results
 
 
 def scanner_loop() -> None:
+    # Uygulama ayağa kalktıktan sonra küçük gecikme
+    time.sleep(5)
+
     while True:
         try:
             scan_once()
         except Exception as e:
             print(f"scanner_loop hata: {e}")
+
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 
@@ -522,22 +591,6 @@ def health():
     })
 
 
-@app.route("/scan-now")
-def scan_now():
-    try:
-        results = scan_once()
-        return jsonify({
-            "ok": True,
-            "message": "Manual scan completed",
-            "results": results,
-        })
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-        }), 500
-
-
 @app.route("/analyze/<path:symbol>")
 def analyze_route(symbol: str):
     symbol = symbol.strip()
@@ -553,6 +606,19 @@ def analyze_route(symbol: str):
     return jsonify({
         "ok": True,
         "result": result,
+    })
+
+
+@app.route("/status")
+def status():
+    return jsonify({
+        "ok": True,
+        "service_started_at": STATE.get("service_started_at"),
+        "scanner_started": STATE.get("scanner_started"),
+        "last_scan_at": STATE.get("last_scan_at"),
+        "markets": MARKETS,
+        "last_results": STATE.get("last_results", {}),
+        "active_signals": STATE.get("active_signals", {}),
     })
 
 
