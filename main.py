@@ -20,21 +20,12 @@ PORT = int(os.getenv("PORT", "10000"))
 # =========================================================
 # SETTINGS
 # =========================================================
-SCAN_INTERVAL_SECONDS = 600  # 10 dakika
+SCAN_INTERVAL_SECONDS = 600           # 10 dakika
 TIMEFRAME = "15min"
 OUTPUTSIZE = 60
-
-# Sadece A ve A+ gelsin
-MIN_SIGNAL_SCORE = 75
-
-# Aynı yönde sürekli spam atmasın
+MIN_SIGNAL_SCORE = 75                # sadece A ve A+
 SIGNAL_COOLDOWN_MINUTES = 45
 
-# Scanner durmuş sayılmadan önce heartbeat süresi
-SCANNER_HEARTBEAT_STALE_MINUTES = 20
-SCANNER_MONITOR_INTERVAL_SECONDS = 30
-
-# İzlenen pariteler
 MARKETS = [
     "EUR/USD",
     "GBP/USD",
@@ -53,16 +44,12 @@ STATE: Dict[str, Any] = {
     "active_signals": {},
     "scanner_started": False,
     "scanner_last_heartbeat": None,
-    "scanner_restart_count": 0,
     "last_error": None,
 }
 
 scan_lock = threading.Lock()
-scanner_state_lock = threading.Lock()
-monitor_state_lock = threading.Lock()
-
 scanner_thread: Optional[threading.Thread] = None
-monitor_thread: Optional[threading.Thread] = None
+scanner_start_lock = threading.Lock()
 
 http = requests.Session()
 
@@ -92,7 +79,8 @@ def minutes_since(iso_dt: Optional[str]) -> float:
         dt = datetime.fromisoformat(iso_dt)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return (now_utc() - dt).total_seconds() / 60.0
+        delta = now_utc() - dt
+        return delta.total_seconds() / 60.0
     except Exception:
         return 999999.0
 
@@ -125,10 +113,6 @@ def send_telegram_message(text: str) -> bool:
 
 
 def get_killzone_label() -> str:
-    """
-    Basit Türkiye saati bazlı killzone etiketi.
-    Killzone zorunlu değildir, bonus puan verir.
-    """
     hour = datetime.now().hour
 
     if 10 <= hour <= 12:
@@ -183,12 +167,13 @@ def fetch_twelvedata_series(symbol: str) -> Optional[Dict[str, Any]]:
 
 
 # =========================================================
-# ANALYSIS HELPERS
+# CANDLE HELPERS
 # =========================================================
 def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+    values = raw.get("values", [])
     candles: List[Dict[str, Any]] = []
 
-    for row in raw.get("values", []):
+    for row in values:
         o = safe_float(row.get("open"))
         h = safe_float(row.get("high"))
         l = safe_float(row.get("low"))
@@ -207,16 +192,19 @@ def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
             }
         )
 
-    # TwelveData genelde en yeni mumu üstte döndürür
+    # TwelveData çoğu zaman en yeni mumu üstte verir
     candles.reverse()
     return candles
 
 
+# =========================================================
+# ANALYSIS HELPERS
+# =========================================================
 def detect_bias(candles: List[Dict[str, Any]]) -> str:
     if len(candles) < 20:
         return "Nötr"
 
-    closes = [x["close"] for x in candles[-20:]]
+    closes = [c["close"] for c in candles[-20:]]
     sma_5 = sum(closes[-5:]) / 5
     sma_20 = sum(closes) / 20
 
@@ -231,7 +219,8 @@ def detect_choch_like(candles: List[Dict[str, Any]]) -> str:
     if len(candles) < 4:
         return "Yok"
 
-    _, b, _, d = candles[-4], candles[-3], candles[-2], candles[-1]
+    b = candles[-3]
+    d = candles[-1]
 
     if d["close"] > b["high"]:
         return "Bullish CHoCH"
@@ -265,10 +254,8 @@ def detect_liquidity_sweep(candles: List[Dict[str, Any]]) -> str:
 
     if last["high"] > prev_high and last["close"] < prev_high:
         return "Üst likidite sweep"
-
     if last["low"] < prev_low and last["close"] > prev_low:
         return "Alt likidite sweep"
-
     return "Yok"
 
 
@@ -276,7 +263,7 @@ def detect_displacement(candles: List[Dict[str, Any]]) -> str:
     if len(candles) < 10:
         return "Zayıf"
 
-    bodies = [abs(x["close"] - x["open"]) for x in candles[-10:-1]]
+    bodies = [abs(c["close"] - c["open"]) for c in candles[-10:-1]]
     avg_body = sum(bodies) / len(bodies) if bodies else 0
     last_body = abs(candles[-1]["close"] - candles[-1]["open"])
 
@@ -285,10 +272,8 @@ def detect_displacement(candles: List[Dict[str, Any]]) -> str:
 
     if last_body >= avg_body * 1.8:
         return "Güçlü"
-
     if last_body >= avg_body * 1.2:
         return "Orta"
-
     return "Zayıf"
 
 
@@ -313,14 +298,13 @@ def detect_fvg(candles: List[Dict[str, Any]]) -> str:
     if len(candles) < 3:
         return "Yok"
 
-    a, _, c = candles[-3], candles[-2], candles[-1]
+    a = candles[-3]
+    c = candles[-1]
 
     if c["low"] > a["high"]:
         return "Bullish FVG"
-
     if c["high"] < a["low"]:
         return "Bearish FVG"
-
     return "Yok"
 
 
@@ -331,56 +315,44 @@ def detect_true_order_block(candles: List[Dict[str, Any]], direction: str) -> st
     lookback = candles[-8:-1]
 
     if direction == "LONG":
-        for candle in reversed(lookback):
-            if candle["close"] < candle["open"]:
-                return f"Bullish OB adayı ({candle['low']:.5f} - {candle['high']:.5f})"
+        for c in reversed(lookback):
+            if c["close"] < c["open"]:
+                return f"Bullish OB adayı ({c['low']:.5f} - {c['high']:.5f})"
 
     elif direction == "SHORT":
-        for candle in reversed(lookback):
-            if candle["close"] > candle["open"]:
-                return f"Bearish OB adayı ({candle['low']:.5f} - {candle['high']:.5f})"
+        for c in reversed(lookback):
+            if c["close"] > c["open"]:
+                return f"Bearish OB adayı ({c['low']:.5f} - {c['high']:.5f})"
 
-    
-
-def get_recent_swing_high(candles: List[Dict[str, Any]], lookback: int = 6) -> Optional[float]:
-    if len(candles) < lookback:
-        return None
-    return max(x["high"] for x in candles[-lookback:])
+    return "Yok"
 
 
-def get_recent_swing_low(candles: List[Dict[str, Any]], lookback: int = 6) -> Optional[float]:
-    if len(candles) < lookback:
-        return None
-    return min(x["low"] for x in candles[-lookback:])
-
-
-def detect_pair_smt(
+# =========================================================
+# SMT
+# =========================================================
+def smt_compare_pair(
     candles_a: List[Dict[str, Any]],
     candles_b: List[Dict[str, Any]],
-    lookback: int = 6,
 ) -> str:
-    """
-    Basit SMT mantığı:
-    - A yeni high yapıyor, B yapmıyorsa -> Bearish SMT
-    - A yeni low yapıyor, B yapmıyorsa -> Bullish SMT
-    """
-    if len(candles_a) < lookback + 1 or len(candles_b) < lookback + 1:
+    if len(candles_a) < 6 or len(candles_b) < 6:
         return "Yok"
 
-    prev_high_a = max(x["high"] for x in candles_a[-(lookback + 1):-1])
-    prev_low_a = min(x["low"] for x in candles_a[-(lookback + 1):-1])
+    a_recent = candles_a[-6:]
+    b_recent = candles_b[-6:]
 
-    prev_high_b = max(x["high"] for x in candles_b[-(lookback + 1):-1])
-    prev_low_b = min(x["low"] for x in candles_b[-(lookback + 1):-1])
+    a_prev_high = max(x["high"] for x in a_recent[:-1])
+    a_prev_low = min(x["low"] for x in a_recent[:-1])
+    b_prev_high = max(x["high"] for x in b_recent[:-1])
+    b_prev_low = min(x["low"] for x in b_recent[:-1])
 
-    last_a = candles_a[-1]
-    last_b = candles_b[-1]
+    a_last = a_recent[-1]
+    b_last = b_recent[-1]
 
-    a_makes_higher_high = last_a["high"] > prev_high_a
-    b_makes_higher_high = last_b["high"] > prev_high_b
+    a_makes_higher_high = a_last["high"] > a_prev_high
+    b_makes_higher_high = b_last["high"] > b_prev_high
 
-    a_makes_lower_low = last_a["low"] < prev_low_a
-    b_makes_lower_low = last_b["low"] < prev_low_b
+    a_makes_lower_low = a_last["low"] < a_prev_low
+    b_makes_lower_low = b_last["low"] < b_prev_low
 
     if a_makes_higher_high and not b_makes_higher_high:
         return "Bearish SMT"
@@ -392,12 +364,6 @@ def detect_pair_smt(
 
 
 def detect_smt_for_symbol(symbol: str, market_candles: Dict[str, List[Dict[str, Any]]]) -> str:
-    """
-    Öncelikli korelasyonlar:
-    EUR/USD <-> GBP/USD
-    EUR/USD <-> AUD/USD
-    GBP/USD <-> AUD/USD
-    """
     if symbol not in market_candles:
         return "Yok"
 
@@ -407,20 +373,18 @@ def detect_smt_for_symbol(symbol: str, market_candles: Dict[str, List[Dict[str, 
         "AUD/USD": ["EUR/USD", "GBP/USD"],
     }
 
-    peers = pairs_map.get(symbol, [])
-    if not peers:
+    compare_list = pairs_map.get(symbol, [])
+    if not compare_list:
         return "Yok"
 
-    base_candles = market_candles.get(symbol)
-    if not base_candles:
-        return "Yok"
+    symbol_candles = market_candles[symbol]
 
-    for peer in peers:
-        peer_candles = market_candles.get(peer)
-        if not peer_candles:
+    for other_symbol in compare_list:
+        other_candles = market_candles.get(other_symbol)
+        if not other_candles:
             continue
 
-        smt = detect_smt_for_symbol(symbol, market_candles or {})
+        smt = smt_compare_pair(symbol_candles, other_candles)
         if smt != "Yok":
             return smt
 
@@ -465,7 +429,6 @@ def score_signal(
     killzone_active: bool,
     true_order_block: str,
 ) -> Dict[str, Any]:
-    # Zorunlular tamamlandıysa taban puan
     score = 40
     quality = "Yok"
 
@@ -476,6 +439,8 @@ def score_signal(
             score += 15
         if premium_discount == "Discount":
             score += 15
+        if smt == "Bullish SMT":
+            score += 10
 
     elif direction == "SHORT":
         if bias == "Düşüş":
@@ -484,12 +449,12 @@ def score_signal(
             score += 15
         if premium_discount == "Premium":
             score += 15
+        if smt == "Bearish SMT":
+            score += 10
 
-    # Bonuslar
     if killzone_active:
         score += 10
-    if smt != "Yok":
-        score += 10
+
     if true_order_block != "Yok":
         score += 10
 
@@ -512,6 +477,7 @@ def build_trade_levels(candles: List[Dict[str, Any]], direction: str) -> Dict[st
 
     last = candles[-1]
     recent = candles[-10:]
+
     recent_high = max(x["high"] for x in recent)
     recent_low = min(x["low"] for x in recent)
     price = last["close"]
@@ -532,24 +498,21 @@ def build_trade_levels(candles: List[Dict[str, Any]], direction: str) -> Dict[st
     return {"entry": price, "sl": sl, "tp": tp}
 
 
+# =========================================================
+# ANALYZE SYMBOL
+# =========================================================
 def analyze_symbol(
     symbol: str,
-    raw_data_map: Optional[Dict[str, Dict[str, Any]]] = None,
     market_candles: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Optional[Dict[str, Any]]:
-    raw = None
-
-    if raw_data_map and symbol in raw_data_map:
-        raw = raw_data_map[symbol]
-    else:
-        raw = fetch_twelvedata_series(symbol)
-
-    if not raw:
-        return None
+    candles: List[Dict[str, Any]] = []
 
     if market_candles and symbol in market_candles:
         candles = market_candles[symbol]
     else:
+        raw = fetch_twelvedata_series(symbol)
+        if not raw:
+            return None
         candles = build_candles(raw)
 
     if len(candles) < 20:
@@ -644,6 +607,9 @@ def analyze_symbol(
     }
 
 
+# =========================================================
+# SIGNAL FORMAT / FILTER
+# =========================================================
 def format_signal_message(result: Dict[str, Any]) -> str:
     entry = f"{result['entry']:.5f}" if result["entry"] is not None else "Yok"
     sl = f"{result['sl']:.5f}" if result["sl"] is not None else "Yok"
@@ -683,8 +649,10 @@ def should_send_signal(result: Dict[str, Any]) -> bool:
 
     if direction == "YOK":
         return False
+
     if score < MIN_SIGNAL_SCORE:
         return False
+
     if quality not in ("A", "A+"):
         return False
 
@@ -711,28 +679,27 @@ def scan_once() -> Dict[str, Any]:
         mark_scanner_heartbeat()
 
         results: Dict[str, Any] = {}
-
-        raw_data_map: Dict[str, Dict[str, Any]] = {}
         market_candles: Dict[str, List[Dict[str, Any]]] = {}
 
-        for s in MARKETS:
-            try:
-                raw = fetch_twelvedata_series(s)
-                if raw:
-                    raw_data_map[s] = raw
-                    market_candles[s] = build_candles(raw)
-                else:
-                    print(f"{s} için raw data alınamadı.")
-            except Exception as e:
-                print(f"{s} preload hatası: {e}")
-
+        # 1) Tüm market verilerini önce çek
         for symbol in MARKETS:
             try:
-                result = analyze_symbol(
-                    symbol,
-                    raw_data_map=raw_data_map,
-                    market_candles=market_candles,
-                )
+                raw = fetch_twelvedata_series(symbol)
+                if raw:
+                    candles = build_candles(raw)
+                    if candles:
+                        market_candles[symbol] = candles
+                    else:
+                        print(f"{symbol} için candle üretilemedi.")
+                else:
+                    print(f"{symbol} için raw data alınamadı.")
+            except Exception as e:
+                print(f"{symbol} preload hatası: {e}")
+
+        # 2) Sonra analiz et
+        for symbol in MARKETS:
+            try:
+                result = analyze_symbol(symbol, market_candles=market_candles)
 
                 if not result:
                     results[symbol] = {"ok": False, "error": "analysis_failed"}
@@ -794,13 +761,10 @@ def scanner_loop() -> None:
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 
-# =========================================================
-# SCANNER CONTROL
-# =========================================================
 def start_background_scanner() -> None:
     global scanner_thread
 
-    with scanner_state_lock:
+    with scanner_start_lock:
         if scanner_thread and scanner_thread.is_alive():
             STATE["scanner_started"] = True
             return
@@ -808,54 +772,7 @@ def start_background_scanner() -> None:
         scanner_thread = threading.Thread(target=scanner_loop, daemon=True)
         scanner_thread.start()
         STATE["scanner_started"] = True
-        STATE["scanner_restart_count"] += 1
-        mark_scanner_heartbeat()
         print("Background scanner başlatıldı.")
-
-
-def ensure_scanner_running() -> None:
-    global scanner_thread
-
-    need_restart = False
-
-    with scanner_state_lock:
-        if scanner_thread is None or not scanner_thread.is_alive():
-            need_restart = True
-
-    if need_restart:
-        print("Scanner durmuş veya başlamamış. Yeniden başlatılıyor...")
-        start_background_scanner()
-        return
-
-    heartbeat_age = minutes_since(STATE.get("scanner_last_heartbeat"))
-    if heartbeat_age > SCANNER_HEARTBEAT_STALE_MINUTES:
-        print("Scanner heartbeat çok eski. Yeniden başlatılıyor...")
-        start_background_scanner()
-
-
-def monitor_loop() -> None:
-    time.sleep(3)
-
-    while True:
-        try:
-            ensure_scanner_running()
-        except Exception as e:
-            STATE["last_error"] = str(e)
-            print(f"monitor_loop hata: {e}")
-
-        time.sleep(SCANNER_MONITOR_INTERVAL_SECONDS)
-
-
-def start_monitor_once() -> None:
-    global monitor_thread
-
-    with monitor_state_lock:
-        if monitor_thread and monitor_thread.is_alive():
-            return
-
-        monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-        monitor_thread.start()
-        print("Scanner monitor başlatıldı.")
 
 
 # =========================================================
@@ -863,16 +780,14 @@ def start_monitor_once() -> None:
 # =========================================================
 @app.route("/")
 def home():
-    ensure_scanner_running()
     return jsonify(
         {
             "ok": True,
             "service": "trade-konseyi",
             "message": "Service is running",
             "scanner_started": STATE.get("scanner_started"),
-            "scanner_restart_count": STATE.get("scanner_restart_count"),
-            "scanner_last_heartbeat": STATE.get("scanner_last_heartbeat"),
             "last_scan_at": STATE.get("last_scan_at"),
+            "scanner_last_heartbeat": STATE.get("scanner_last_heartbeat"),
             "markets": MARKETS,
         }
     )
@@ -880,16 +795,13 @@ def home():
 
 @app.route("/health")
 def health():
-    ensure_scanner_running()
     return jsonify(
         {
             "ok": True,
             "scanner_started": STATE.get("scanner_started"),
-            "scanner_restart_count": STATE.get("scanner_restart_count"),
-            "scanner_last_heartbeat": STATE.get("scanner_last_heartbeat"),
             "last_scan_at": STATE.get("last_scan_at"),
+            "scanner_last_heartbeat": STATE.get("scanner_last_heartbeat"),
             "watched_markets": len(MARKETS),
-            "last_error": STATE.get("last_error"),
             "env": {
                 "TWELVEDATA_API_KEY": bool(TWELVEDATA_API_KEY),
                 "TELEGRAM_BOT_TOKEN": bool(TELEGRAM_BOT_TOKEN),
@@ -899,9 +811,25 @@ def health():
     )
 
 
+@app.route("/status")
+def status():
+    return jsonify(
+        {
+            "ok": True,
+            "service_started_at": STATE.get("service_started_at"),
+            "scanner_started": STATE.get("scanner_started"),
+            "scanner_last_heartbeat": STATE.get("scanner_last_heartbeat"),
+            "last_scan_at": STATE.get("last_scan_at"),
+            "markets": MARKETS,
+            "last_results": STATE.get("last_results", {}),
+            "active_signals": STATE.get("active_signals", {}),
+            "last_error": STATE.get("last_error"),
+        }
+    )
+
+
 @app.route("/analyze/<path:symbol>")
 def analyze_route(symbol: str):
-    ensure_scanner_running()
     symbol = symbol.strip()
     result = analyze_symbol(symbol)
 
@@ -922,25 +850,6 @@ def analyze_route(symbol: str):
     )
 
 
-@app.route("/status")
-def status():
-    ensure_scanner_running()
-    return jsonify(
-        {
-            "ok": True,
-            "service_started_at": STATE.get("service_started_at"),
-            "scanner_started": STATE.get("scanner_started"),
-            "scanner_restart_count": STATE.get("scanner_restart_count"),
-            "scanner_last_heartbeat": STATE.get("scanner_last_heartbeat"),
-            "last_scan_at": STATE.get("last_scan_at"),
-            "last_error": STATE.get("last_error"),
-            "markets": MARKETS,
-            "last_results": STATE.get("last_results", {}),
-            "active_signals": STATE.get("active_signals", {}),
-        }
-    )
-
-
 # =========================================================
 # STARTUP
 # =========================================================
@@ -948,7 +857,7 @@ print(f"TWELVEDATA_API_KEY dolu mu: {'evet' if bool(TWELVEDATA_API_KEY) else 'ha
 print(f"TELEGRAM_BOT_TOKEN dolu mu: {'evet' if bool(TELEGRAM_BOT_TOKEN) else 'hayır'}")
 print(f"TELEGRAM_CHAT_ID dolu mu: {'evet' if bool(TELEGRAM_CHAT_ID) else 'hayır'}")
 
-start_monitor_once()
+start_background_scanner()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)
