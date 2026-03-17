@@ -23,11 +23,18 @@ PORT = int(os.getenv("PORT", "10000"))
 SCAN_INTERVAL_SECONDS = 600  # 10 dakika
 TIMEFRAME = "15min"
 OUTPUTSIZE = 60
-MIN_SIGNAL_SCORE = 75  # sadece A / A+
+
+# Sadece A ve A+ gelsin
+MIN_SIGNAL_SCORE = 75
+
+# Aynı yönde sürekli spam atmasın
 SIGNAL_COOLDOWN_MINUTES = 45
+
+# Scanner durmuş sayılmadan önce heartbeat süresi
 SCANNER_HEARTBEAT_STALE_MINUTES = 20
 SCANNER_MONITOR_INTERVAL_SECONDS = 30
 
+# İzlenen pariteler
 MARKETS = [
     "EUR/USD",
     "GBP/USD",
@@ -59,9 +66,8 @@ monitor_thread: Optional[threading.Thread] = None
 
 http = requests.Session()
 
-
 # =========================================================
-# TIME / UTILS
+# UTILS
 # =========================================================
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -86,8 +92,7 @@ def minutes_since(iso_dt: Optional[str]) -> float:
         dt = datetime.fromisoformat(iso_dt)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        delta = now_utc() - dt
-        return delta.total_seconds() / 60.0
+        return (now_utc() - dt).total_seconds() / 60.0
     except Exception:
         return 999999.0
 
@@ -110,11 +115,9 @@ def send_telegram_message(text: str) -> bool:
     try:
         response = http.post(url, json=payload, timeout=20)
         print(f"Telegram status: {response.status_code}")
-
         if response.status_code != 200:
             print(f"Telegram response: {response.text}")
             return False
-
         return True
     except Exception as e:
         print(f"Telegram gönderim hatası: {e}")
@@ -124,7 +127,7 @@ def send_telegram_message(text: str) -> bool:
 def get_killzone_label() -> str:
     """
     Basit Türkiye saati bazlı killzone etiketi.
-    Killzone zorunlu DEĞİL, sadece puan artırır.
+    Killzone zorunlu değildir, bonus puan verir.
     """
     hour = datetime.now().hour
 
@@ -183,10 +186,9 @@ def fetch_twelvedata_series(symbol: str) -> Optional[Dict[str, Any]]:
 # ANALYSIS HELPERS
 # =========================================================
 def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
-    values = raw.get("values", [])
     candles: List[Dict[str, Any]] = []
 
-    for row in values:
+    for row in raw.get("values", []):
         o = safe_float(row.get("open"))
         h = safe_float(row.get("high"))
         l = safe_float(row.get("low"))
@@ -205,7 +207,7 @@ def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
             }
         )
 
-    # TwelveData çoğu zaman en yeni mumu üstte verir
+    # TwelveData genelde en yeni mumu üstte döndürür
     candles.reverse()
     return candles
 
@@ -214,7 +216,7 @@ def detect_bias(candles: List[Dict[str, Any]]) -> str:
     if len(candles) < 20:
         return "Nötr"
 
-    closes = [c["close"] for c in candles[-20:]]
+    closes = [x["close"] for x in candles[-20:]]
     sma_5 = sum(closes[-5:]) / 5
     sma_20 = sum(closes) / 20
 
@@ -263,8 +265,10 @@ def detect_liquidity_sweep(candles: List[Dict[str, Any]]) -> str:
 
     if last["high"] > prev_high and last["close"] < prev_high:
         return "Üst likidite sweep"
+
     if last["low"] < prev_low and last["close"] > prev_low:
         return "Alt likidite sweep"
+
     return "Yok"
 
 
@@ -272,7 +276,7 @@ def detect_displacement(candles: List[Dict[str, Any]]) -> str:
     if len(candles) < 10:
         return "Zayıf"
 
-    bodies = [abs(c["close"] - c["open"]) for c in candles[-10:-1]]
+    bodies = [abs(x["close"] - x["open"]) for x in candles[-10:-1]]
     avg_body = sum(bodies) / len(bodies) if bodies else 0
     last_body = abs(candles[-1]["close"] - candles[-1]["open"])
 
@@ -281,8 +285,10 @@ def detect_displacement(candles: List[Dict[str, Any]]) -> str:
 
     if last_body >= avg_body * 1.8:
         return "Güçlü"
+
     if last_body >= avg_body * 1.2:
         return "Orta"
+
     return "Zayıf"
 
 
@@ -311,8 +317,10 @@ def detect_fvg(candles: List[Dict[str, Any]]) -> str:
 
     if c["low"] > a["high"]:
         return "Bullish FVG"
+
     if c["high"] < a["low"]:
         return "Bearish FVG"
+
     return "Yok"
 
 
@@ -323,20 +331,21 @@ def detect_true_order_block(candles: List[Dict[str, Any]], direction: str) -> st
     lookback = candles[-8:-1]
 
     if direction == "LONG":
-        for c in reversed(lookback):
-            if c["close"] < c["open"]:
-                return f"Bullish OB adayı ({c['low']:.5f} - {c['high']:.5f})"
+        for candle in reversed(lookback):
+            if candle["close"] < candle["open"]:
+                return f"Bullish OB adayı ({candle['low']:.5f} - {candle['high']:.5f})"
 
     elif direction == "SHORT":
-        for c in reversed(lookback):
-            if c["close"] > c["open"]:
-                return f"Bearish OB adayı ({c['low']:.5f} - {c['high']:.5f})"
+        for candle in reversed(lookback):
+            if candle["close"] > candle["open"]:
+                return f"Bearish OB adayı ({candle['low']:.5f} - {candle['high']:.5f})"
 
     return "Yok"
 
 
 def detect_smt_placeholder(symbol: str) -> str:
     _ = symbol
+    # Burayı sonra gerçek cross-market SMT ile büyütebiliriz
     return "Yok"
 
 
@@ -378,7 +387,8 @@ def score_signal(
     killzone_active: bool,
     true_order_block: str,
 ) -> Dict[str, Any]:
-    score = 40  # zorunlular sağlandıysa taban puan
+    # Zorunlular tamamlandıysa taban puan
+    score = 40
     quality = "Yok"
 
     if direction == "LONG":
@@ -397,7 +407,7 @@ def score_signal(
         if premium_discount == "Premium":
             score += 15
 
-    # opsiyoneller
+    # Bonuslar
     if killzone_active:
         score += 10
     if smt != "Yok":
@@ -424,7 +434,6 @@ def build_trade_levels(candles: List[Dict[str, Any]], direction: str) -> Dict[st
 
     last = candles[-1]
     recent = candles[-10:]
-
     recent_high = max(x["high"] for x in recent)
     recent_low = min(x["low"] for x in recent)
     price = last["close"]
@@ -582,10 +591,8 @@ def should_send_signal(result: Dict[str, Any]) -> bool:
 
     if direction == "YOK":
         return False
-
     if score < MIN_SIGNAL_SCORE:
         return False
-
     if quality not in ("A", "A+"):
         return False
 
@@ -652,7 +659,7 @@ def scan_once() -> Dict[str, Any]:
 
                 mark_scanner_heartbeat()
 
-except Exception as e:
+            except Exception as e:
                 results[symbol] = {"ok": False, "error": str(e)}
                 STATE["last_error"] = str(e)
                 print(f"{symbol} scan hatası: {e}")
@@ -678,7 +685,7 @@ def scanner_loop() -> None:
 
 
 # =========================================================
-# SCANNER CONTROL (AUTO START + SELF HEAL)
+# SCANNER CONTROL
 # =========================================================
 def start_background_scanner() -> None:
     global scanner_thread
@@ -835,4 +842,3 @@ start_monitor_once()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
