@@ -701,27 +701,29 @@ def scan_once() -> Dict[str, Any]:
         mark_scanner_heartbeat()
 
         results: Dict[str, Any] = {}
-raw_data_map: Dict[str, Dict[str, Any]] = {}
+
+        raw_data_map: Dict[str, Dict[str, Any]] = {}
         market_candles: Dict[str, List[Dict[str, Any]]] = {}
+
+        for s in MARKETS:
+            try:
+                raw = fetch_twelvedata_series(s)
+                if raw:
+                    raw_data_map[s] = raw
+                    market_candles[s] = build_candles(raw)
+                else:
+                    print(f"{s} için raw data alınamadı.")
+            except Exception as e:
+                print(f"{s} preload hatası: {e}")
 
         for symbol in MARKETS:
             try:
-                raw = fetch_twelvedata_series(symbol)
-                if raw:
-                    raw_data_map[symbol] = raw
-                    market_candles[symbol] = build_candles(raw)
-                else:
-                    print(f"{symbol} için raw data alınamadı.")
-            except Exception as e:
-                print(f"{symbol} preload hatası: {e}")
-        for symbol in MARKETS:
-            try:
-              
- result = analyze_symbol(
+                result = analyze_symbol(
                     symbol,
                     raw_data_map=raw_data_map,
                     market_candles=market_candles,
                 )
+
                 if not result:
                     results[symbol] = {"ok": False, "error": "analysis_failed"}
                     print(f"{symbol} analiz üretilemedi.")
