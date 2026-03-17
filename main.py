@@ -1,16 +1,12 @@
-from flask import Flask, jsonify
 import os
 import time
 import json
-import gc
 import threading
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple, List
-import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
 import requests
-from tvDatafeed import TvDatafeed, Interval
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
@@ -19,1276 +15,630 @@ app = Flask(__name__)
 # =========================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TV_USERNAME = os.getenv("TV_USERNAME", "").strip()
-TV_PASSWORD = os.getenv("TV_PASSWORD", "").strip()
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
+
+PORT = int(os.getenv("PORT", "10000"))
 
 # =========================================================
 # SETTINGS
 # =========================================================
 SCAN_INTERVAL_SECONDS = 60
-MIN_SIGNAL_CONFIDENCE = 74
+TIMEFRAME = "15min"
+OUTPUTSIZE = 120
+
+# Çalıştığı doğrulanan semboller
+MARKETS = [
+    "EUR/USD",
+    "GBP/USD",
+    "XAU/USD",
+    "USD/JPY",
+    "AUD/USD",
+    "DX",
+]
+
+STATE_FILE = "state.json"
+
+# Aynı yönde sürekli spam atmaması için cooldown
 SIGNAL_COOLDOWN_MINUTES = 45
 
-DEFAULT_SL_ATR_MULT = 1.20
-DEFAULT_TP_ATR_MULT = 2.20
-
-STATE_FILE = "bot_state.json"
-
-NEWS_BLOCK_BEFORE_MIN = 30
-NEWS_BLOCK_AFTER_MIN = 15
-NEWS_CACHE_MINUTES = 15
+# Basit eşik
+MIN_SIGNAL_SCORE = 75
 
 # =========================================================
-# MARKETS
+# GLOBAL STATE
 # =========================================================
-MARKETS: Dict[str, Dict[str, Any]] = {
-    "EURUSD": {"symbol": "EURUSD", "exchange": "OANDA", "news": ["EUR", "USD"]},
-    "GBPUSD": {"symbol": "GBPUSD", "exchange": "OANDA", "news": ["GBP", "USD"]},
-    "DXY": {"symbol": "DXY", "exchange": "TVC", "news": ["USD"]},
-    "XAUUSD": {"symbol": "XAUUSD", "exchange": "OANDA", "news": ["USD"]},
-    "NASDAQ": {"symbol": "US100", "exchange": "CAPITALCOM", "news": ["USD"]},
-    "SPX500": {"symbol": "US500", "exchange": "CAPITALCOM", "news": ["USD"]},
-    "USOIL": {"symbol": "USOIL", "exchange": "CAPITALCOM", "news": ["USD"]},
-}
-
-SMT_PAIRS = {
-    "EURUSD": "GBPUSD",
-    "GBPUSD": "EURUSD",
-    "NASDAQ": "SPX500",
-    "SPX500": "NASDAQ",
-    "XAUUSD": "DXY",
-    "DXY": "XAUUSD",
-}
-
-# =========================================================
-# GLOBALS
-# =========================================================
-tv: Optional[TvDatafeed] = None
-
 STATE: Dict[str, Any] = {
     "active_signals": {},
-    "recent_signal_keys": {},
     "last_scan_at": None,
+    "service_started_at": datetime.now(timezone.utc).isoformat(),
 }
 
-_last_scan_data_cache: Dict[str, Dict[str, pd.DataFrame]] = {}
-_last_scan_data_ts: Optional[datetime] = None
-CACHE_TTL_SECONDS = 25
-
-_news_cache: List[Dict[str, Any]] = []
-_news_cache_ts: Optional[datetime] = None
+scan_lock = threading.Lock()
 
 # =========================================================
-# GENERAL
+# UTILS
 # =========================================================
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-
-def round_price(market: str, value: Optional[float]) -> Optional[float]:
-    if value is None:
-        return None
-    if market in ["EURUSD", "GBPUSD"]:
-        return round(float(value), 5)
-    return round(float(value), 2)
-
-
-def df_last_close(df: Optional[pd.DataFrame]) -> Optional[float]:
-    if df is None or df.empty:
-        return None
-    return float(df.iloc[-1]["close"])
-
-
-def avg_range(df: pd.DataFrame, lookback: int = 14) -> Optional[float]:
-    if df is None or len(df) < lookback:
-        return None
-    x = df.tail(lookback)
-    return float((x["high"] - x["low"]).mean())
-
-
-def candle_body(row: pd.Series) -> float:
-    return abs(float(row["close"] - row["open"]))
-
-
-def candle_range(row: pd.Series) -> float:
-    return float(row["high"] - row["low"])
-
-
-def local_high(df: pd.DataFrame, idx: int, left: int = 2, right: int = 2) -> bool:
-    if idx - left < 0 or idx + right >= len(df):
-        return False
-    level = float(df.iloc[idx]["high"])
-    for i in range(idx - left, idx + right + 1):
-        if i == idx:
-            continue
-        if float(df.iloc[i]["high"]) >= level:
-            return False
-    return True
-
-
-def local_low(df: pd.DataFrame, idx: int, left: int = 2, right: int = 2) -> bool:
-    if idx - left < 0 or idx + right >= len(df):
-        return False
-    level = float(df.iloc[idx]["low"])
-    for i in range(idx - left, idx + right + 1):
-        if i == idx:
-            continue
-        if float(df.iloc[i]["low"]) <= level:
-            return False
-    return True
-
-
-def last_swing_high(df: pd.DataFrame, lookback: int = 60) -> Optional[Tuple[int, float]]:
-    if df is None or len(df) < 10:
-        return None
-    start = max(2, len(df) - lookback)
-    result = None
-    for i in range(start, len(df) - 2):
-        if local_high(df, i):
-            result = (i, float(df.iloc[i]["high"]))
-    return result
-
-
-def last_swing_low(df: pd.DataFrame, lookback: int = 60) -> Optional[Tuple[int, float]]:
-    if df is None or len(df) < 10:
-        return None
-    start = max(2, len(df) - lookback)
-    result = None
-    for i in range(start, len(df) - 2):
-        if local_low(df, i):
-            result = (i, float(df.iloc[i]["low"]))
-    return result
-
-
-def session_info() -> Dict[str, Any]:
-    h = utc_now().hour
-
-    if 0 <= h < 6:
-        return {"session": "Asya", "killzone": False}
-    if 6 <= h < 10:
-        return {"session": "Londra Killzone", "killzone": True}
-    if 10 <= h < 13:
-        return {"session": "Londra", "killzone": False}
-    if 13 <= h < 16:
-        return {"session": "London-NY Overlap", "killzone": True}
-    if 16 <= h < 18:
-        return {"session": "New York Killzone", "killzone": True}
-    if 18 <= h < 21:
-        return {"session": "New York", "killzone": False}
-    return {"session": "Geçiş", "killzone": False}
-
-
-def near_zone(price: Optional[float], zone: Optional[Tuple[float, float]], tolerance_ratio: float = 0.15) -> bool:
-    if price is None or zone is None:
-        return False
-    lo, hi = zone
-    width = hi - lo
-    if width <= 0:
-        return False
-    tol = width * tolerance_ratio
-    return (lo - tol) <= price <= (hi + tol)
-
-# =========================================================
-# TELEGRAM
-# =========================================================
-def telegram_api(method: str, payload: dict) -> dict:
-    if not TELEGRAM_BOT_TOKEN:
-        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN eksik"}
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+def safe_float(value: Any) -> Optional[float]:
     try:
-        r = requests.post(url, json=payload, timeout=20)
-        return r.json()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return float(value)
+    except Exception:
+        return None
 
-
-def send_telegram_message(text: str, reply_to_message_id: Optional[int] = None) -> dict:
-    if not TELEGRAM_CHAT_ID:
-        return {"ok": False, "error": "TELEGRAM_CHAT_ID eksik"}
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-    }
-    if reply_to_message_id is not None:
-        payload["reply_to_message_id"] = reply_to_message_id
-
-    return telegram_api("sendMessage", payload)
-
-# =========================================================
-# STATE
-# =========================================================
 def load_state() -> None:
     global STATE
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, dict):
-                STATE["active_signals"] = raw.get("active_signals", {})
-                STATE["recent_signal_keys"] = raw.get("recent_signal_keys", {})
-                STATE["last_scan_at"] = raw.get("last_scan_at")
-    except Exception:
-        pass
-
+                data = json.load(f)
+                if isinstance(data, dict):
+                    STATE.update(data)
+    except Exception as e:
+        print(f"STATE load hatası: {e}")
 
 def save_state() -> None:
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(STATE, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-# =========================================================
-# TV INIT
-# =========================================================
-def init_tv() -> bool:
-    global tv
-    try:
-        print(f"TV_USERNAME dolu mu: {'evet' if bool(TV_USERNAME) else 'hayır'}")
-        print(f"TV_PASSWORD dolu mu: {'evet' if bool(TV_PASSWORD) else 'hayır'}")
-        print(f"TV_USERNAME: {TV_USERNAME}")
-
-        if TV_USERNAME and TV_PASSWORD:
-            print("TradingView login ile bağlanılıyor...")
-            tv = TvDatafeed(username=TV_USERNAME, password=TV_PASSWORD)
-            print("TradingView login denemesi tamamlandı.")
-        else:
-            print("Login bilgisi yok, nologin moda düşülüyor...")
-            tv = TvDatafeed()
-
-        return True
     except Exception as e:
-        print(f"init_tv hatası: {e}")
-        tv = None
+        print(f"STATE save hatası: {e}")
+
+def send_telegram_message(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram env eksik, mesaj gönderilmedi.")
         return False
 
-# =========================================================
-# DATA FETCH
-# =========================================================
-def get_hist_raw(symbol: str, exchange: str, interval: Interval, n_bars: int) -> Optional[pd.DataFrame]:
-    if tv is None:
-        return None
-
-    for _ in range(2):
-        try:
-            df = tv.get_hist(symbol=symbol, exchange=exchange, interval=interval, n_bars=n_bars)
-            if df is None or df.empty:
-                time.sleep(1)
-                continue
-
-            df = df.reset_index()
-
-            if "datetime" in df.columns:
-                df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-
-            keep_cols = [c for c in ["datetime", "open", "high", "low", "close", "volume"] if c in df.columns]
-            df = df[keep_cols]
-
-            for c in ["open", "high", "low", "close", "volume"]:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
-
-            return df
-        except Exception:
-            time.sleep(1)
-
-    return None
-
-
-def get_market_pack(market: str) -> Optional[Dict[str, pd.DataFrame]]:
-    cfg = MARKETS[market]
-    symbol = cfg["symbol"]
-    exchange = cfg["exchange"]
-
-    df_5m = get_hist_raw(symbol, exchange, Interval.in_5_minute, 180)
-    df_15m = get_hist_raw(symbol, exchange, Interval.in_15_minute, 120)
-    df_1h = get_hist_raw(symbol, exchange, Interval.in_1_hour, 100)
-
-    if df_5m is None or df_15m is None or df_1h is None:
-        return None
-
-    return {"5m": df_5m, "15m": df_15m, "1h": df_1h}
-
-
-def build_scan_cache(force_refresh: bool = False) -> Dict[str, Dict[str, pd.DataFrame]]:
-    global _last_scan_data_cache, _last_scan_data_ts
-
-    now = utc_now()
-
-    if (
-        not force_refresh
-        and _last_scan_data_ts is not None
-        and (now - _last_scan_data_ts).total_seconds() < CACHE_TTL_SECONDS
-        and _last_scan_data_cache
-    ):
-        return _last_scan_data_cache
-
-    cache: Dict[str, Dict[str, pd.DataFrame]] = {}
-
-    for market in MARKETS.keys():
-        pack = get_market_pack(market)
-        if pack is not None:
-            cache[market] = pack
-        time.sleep(0.15)
-
-    _last_scan_data_cache = cache
-    _last_scan_data_ts = now
-    gc.collect()
-    return cache
-
-# =========================================================
-# NEWS FILTER
-# =========================================================
-def parse_ff_datetime(date_str: str, time_str: str) -> Optional[datetime]:
-    if not date_str or not time_str:
-        return None
-
-    date_str = date_str.strip()
-    time_str = time_str.strip()
-
-    if time_str.lower() in {"all day", "tentative", ""}:
-        return None
-
-    patterns = [
-        "%m-%d-%Y %I:%M%p",
-        "%Y-%m-%d %I:%M%p",
-        "%m-%d-%Y %H:%M",
-        "%Y-%m-%d %H:%M",
-    ]
-
-    for fmt in patterns:
-        try:
-            dt = datetime.strptime(f"{date_str} {time_str}", fmt)
-            return dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-
-    return None
-
-
-def fetch_forex_factory_news() -> List[Dict[str, Any]]:
-    global _news_cache, _news_cache_ts
-
-    now = utc_now()
-    if (
-        _news_cache_ts is not None
-        and (now - _news_cache_ts) < timedelta(minutes=NEWS_CACHE_MINUTES)
-        and _news_cache
-    ):
-        return _news_cache
-
-    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-    events: List[Dict[str, Any]] = []
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+    }
 
     try:
-        r = requests.get(url, timeout=20)
-        r.raise_for_status()
+        response = requests.post(url, json=payload, timeout=20)
+        if response.status_code == 200:
+            return True
+        print(f"Telegram hata: {response.status_code} - {response.text}")
+        return False
+    except Exception as e:
+        print(f"Telegram gönderim hatası: {e}")
+        return False
 
-        root = ET.fromstring(r.text)
-
-        for item in root.findall(".//event"):
-            country = (item.findtext("country") or "").strip().upper()
-            title = (item.findtext("title") or "").strip()
-            date_str = (item.findtext("date") or "").strip()
-            time_str = (item.findtext("time") or "").strip()
-            impact = (item.findtext("impact") or "").strip().lower()
-
-            if impact not in {"high", "medium", "high impact expected", "medium impact expected"}:
-                continue
-
-            dt = parse_ff_datetime(date_str, time_str)
-            if dt is None:
-                continue
-
-            events.append({
-                "country": country,
-                "title": title,
-                "impact": impact,
-                "datetime": dt,
-            })
-
-        _news_cache = events
-        _news_cache_ts = now
-        return events
-
+def minutes_since(iso_dt: Optional[str]) -> float:
+    if not iso_dt:
+        return 999999.0
+    try:
+        then = datetime.fromisoformat(iso_dt)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - then
+        return delta.total_seconds() / 60.0
     except Exception:
-        return _news_cache if _news_cache else []
+        return 999999.0
 
+# =========================================================
+# TWELVEDATA
+# =========================================================
+def fetch_twelvedata_series(symbol: str, interval: str = TIMEFRAME, outputsize: int = OUTPUTSIZE) -> Optional[Dict[str, Any]]:
+    if not TWELVEDATA_API_KEY:
+        print("TWELVEDATA_API_KEY yok.")
+        return None
 
-def market_news_block(market: str) -> Dict[str, Any]:
-    relevant = set(MARKETS[market]["news"])
-    events = fetch_forex_factory_news()
-    now = utc_now()
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "apikey": TWELVEDATA_API_KEY,
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "format": "JSON",
+    }
 
-    before_delta = timedelta(minutes=NEWS_BLOCK_BEFORE_MIN)
-    after_delta = timedelta(minutes=NEWS_BLOCK_AFTER_MIN)
+    try:
+        response = requests.get(url, params=params, timeout=25)
+        data = response.json()
 
-    blocking_events = []
-    for e in events:
-        if e["country"] not in relevant:
+        if response.status_code != 200:
+            print(f"{symbol} HTTP hata: {response.status_code} - {response.text}")
+            return None
+
+        if data.get("status") == "error":
+            print(f"{symbol} API hata: {data}")
+            return None
+
+        if "values" not in data or not data["values"]:
+            print(f"{symbol} veri boş geldi.")
+            return None
+
+        return data
+
+    except Exception as e:
+        print(f"{symbol} fetch hatası: {e}")
+        return None
+
+# =========================================================
+# ANALYSIS
+# =========================================================
+def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+    values = raw.get("values", [])
+    candles: List[Dict[str, Any]] = []
+
+    for row in values:
+        o = safe_float(row.get("open"))
+        h = safe_float(row.get("high"))
+        l = safe_float(row.get("low"))
+        c = safe_float(row.get("close"))
+
+        if None in (o, h, l, c):
             continue
 
-        if (e["datetime"] - before_delta) <= now <= (e["datetime"] + after_delta):
-            blocking_events.append(e)
+        candles.append({
+            "datetime": row.get("datetime"),
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+        })
 
-    if blocking_events:
-        titles = [f"{e['country']} {e['title']}" for e in blocking_events[:3]]
-        return {
-            "blocked": True,
-            "reason": " | ".join(titles)
-        }
+    # TwelveData çoğu zaman en yeniyi üstte verir.
+    # Analizi soldan sağa yapabilmek için eskiden yeniye çeviriyoruz.
+    candles.reverse()
+    return candles
 
-    return {"blocked": False, "reason": "Yok"}
-
-# =========================================================
-# ANALYSIS PIECES
-# =========================================================
-def detect_htf_bias(df_1h: pd.DataFrame, df_15m: pd.DataFrame) -> str:
-    if df_1h is None or df_15m is None or len(df_1h) < 40 or len(df_15m) < 40:
+def detect_bias(candles: List[Dict[str, Any]]) -> str:
+    if len(candles) < 20:
         return "Nötr"
 
-    c1 = df_1h["close"]
-    c15 = df_15m["close"]
+    closes = [c["close"] for c in candles[-20:]]
+    sma_5 = sum(closes[-5:]) / 5
+    sma_20 = sum(closes) / 20
 
-    ema20_1h = c1.ewm(span=20).mean().iloc[-1]
-    ema50_1h = c1.ewm(span=50).mean().iloc[-1]
-    ema20_15m = c15.ewm(span=20).mean().iloc[-1]
-
-    last1 = float(c1.iloc[-1])
-    last15 = float(c15.iloc[-1])
-
-    if last1 > ema20_1h > ema50_1h and last15 > ema20_15m:
+    if sma_5 > sma_20:
         return "Yükseliş"
-
-    if last1 < ema20_1h < ema50_1h and last15 < ema20_15m:
+    if sma_5 < sma_20:
         return "Düşüş"
-
     return "Nötr"
 
-
-def detect_liquidity_sweep(df_5m: pd.DataFrame) -> Dict[str, Any]:
-    if df_5m is None or len(df_5m) < 50:
-        return {"label": "Yok", "type": None, "level": None}
-
-    prev = df_5m.iloc[:-1]
-    last = df_5m.iloc[-1]
-
-    h = last_swing_high(prev, 55)
-    l = last_swing_low(prev, 55)
-
-    if h:
-        _, level = h
-        if float(last["high"]) > level and float(last["close"]) < level:
-            return {"label": "Üst likidite sweep", "type": "bearish", "level": level}
-
-    if l:
-        _, level = l
-        if float(last["low"]) < level and float(last["close"]) > level:
-            return {"label": "Alt likidite sweep", "type": "bullish", "level": level}
-
-    return {"label": "Yok", "type": None, "level": None}
-
-
-def detect_mss(df_5m: pd.DataFrame) -> Dict[str, Any]:
-    if df_5m is None or len(df_5m) < 60:
-        return {"label": "Yok", "type": None, "level": None}
-
-    prev = df_5m.iloc[:-1]
-    last = df_5m.iloc[-1]
-
-    h = last_swing_high(prev, 50)
-    l = last_swing_low(prev, 50)
-
-    if h and float(last["close"]) > h[1]:
-        return {"label": "Bullish MSS", "type": "bullish", "level": h[1]}
-
-    if l and float(last["close"]) < l[1]:
-        return {"label": "Bearish MSS", "type": "bearish", "level": l[1]}
-
-    return {"label": "Yok", "type": None, "level": None}
-
-
-def detect_choch(df_15m: pd.DataFrame) -> Dict[str, Any]:
-    if df_15m is None or len(df_15m) < 60:
-        return {"label": "Yok", "type": None}
-
-    prev = df_15m.iloc[:-1]
-    last = df_15m.iloc[-1]
-
-    h = last_swing_high(prev, 45)
-    l = last_swing_low(prev, 45)
-
-    if h and float(last["close"]) > h[1]:
-        return {"label": "Bullish CHoCH", "type": "bullish"}
-    if l and float(last["close"]) < l[1]:
-        return {"label": "Bearish CHoCH", "type": "bearish"}
-
-    return {"label": "Yok", "type": None}
-
-
-def detect_displacement(df_5m: pd.DataFrame) -> Dict[str, Any]:
-    if df_5m is None or len(df_5m) < 18:
-        return {"label": "Zayıf", "strong": False}
-
-    ar = avg_range(df_5m.iloc[:-1], 14)
-    if ar is None:
-        return {"label": "Zayıf", "strong": False}
-
-    last = df_5m.iloc[-1]
-    rng = candle_range(last)
-    body = candle_body(last)
-
-    strong = rng >= ar * 1.45 and body >= ar * 0.70
-    return {"label": "Güçlü" if strong else "Zayıf", "strong": strong}
-
-
-def detect_fvg(df_5m: pd.DataFrame) -> Dict[str, Any]:
-    if df_5m is None or len(df_5m) < 3:
-        return {"label": "Yok", "type": None, "zone": None}
-
-    a = df_5m.iloc[-3]
-    b = df_5m.iloc[-2]
-    c = df_5m.iloc[-1]
-
-    if float(a["high"]) < float(c["low"]) and float(b["close"]) > float(b["open"]):
-        return {
-            "label": "Bullish FVG",
-            "type": "bullish",
-            "zone": (float(a["high"]), float(c["low"])),
-        }
-
-    if float(a["low"]) > float(c["high"]) and float(b["close"]) < float(b["open"]):
-        return {
-            "label": "Bearish FVG",
-            "type": "bearish",
-            "zone": (float(c["high"]), float(a["low"])),
-        }
-
-    return {"label": "Yok", "type": None, "zone": None}
-
-
-def detect_ifvg(df_5m: pd.DataFrame) -> Dict[str, Any]:
-    if df_5m is None or len(df_5m) < 8:
-        return {"label": "Yok", "type": None}
-
-    recent = df_5m.tail(8).reset_index(drop=True)
-    left = recent.iloc[:5]
-    right = recent.iloc[5:]
-
-    base = detect_fvg(left)
-    if base["zone"] is None:
-        return {"label": "Yok", "type": None}
-
-    z1, z2 = base["zone"]
-    last_close_ = float(right.iloc[-1]["close"])
-
-    if base["type"] == "bullish" and last_close_ < z1:
-        return {"label": "Bearish iFVG", "type": "bearish"}
-
-    if base["type"] == "bearish" and last_close_ > z2:
-        return {"label": "Bullish iFVG", "type": "bullish"}
-
-    return {"label": "Yok", "type": None}
-
-
-def detect_cisd(df_5m: pd.DataFrame) -> Dict[str, Any]:
-    if df_5m is None or len(df_5m) < 16:
-        return {"label": "Yok", "type": None}
-
-    x = df_5m.tail(10).reset_index(drop=True)
-    first = x.iloc[:5]
-    second = x.iloc[5:]
-
-    first_move = float(first.iloc[-1]["close"] - first.iloc[0]["open"])
-    second_move = float(second.iloc[-1]["close"] - second.iloc[0]["open"])
-
-    if first_move < 0 and second_move > abs(first_move) * 0.55:
-        return {"label": "Bullish CISD", "type": "bullish"}
-
-    if first_move > 0 and second_move < -abs(first_move) * 0.55:
-        return {"label": "Bearish CISD", "type": "bearish"}
-
-    return {"label": "Yok", "type": None}
-
-
-def detect_pd_zone(df_5m: pd.DataFrame) -> str:
-    if df_5m is None or len(df_5m) < 40:
-        return "Belirsiz"
-
-    hi = float(df_5m.tail(35)["high"].max())
-    lo = float(df_5m.tail(35)["low"].min())
-    eq = (hi + lo) / 2
-    px = float(df_5m.iloc[-1]["close"])
-    return "Discount" if px < eq else "Premium"
-
-
-def detect_true_order_block(df_5m: pd.DataFrame) -> Dict[str, Any]:
-    if df_5m is None or len(df_5m) < 20:
-        return {"label": "Yok", "type": None, "zone": None}
-
-    recent = df_5m.tail(12).reset_index(drop=True)
-
-    for i in range(len(recent) - 3, 1, -1):
-        cur = recent.iloc[i]
-        nxt = recent.iloc[i + 1]
-
-        if float(cur["close"]) < float(cur["open"]):
-            if candle_range(nxt) > candle_range(cur) * 1.2 and float(nxt["close"]) > float(cur["high"]):
-                return {
-                    "label": "Bullish OB",
-                    "type": "bullish",
-                    "zone": (float(cur["low"]), float(cur["high"])),
-                }
-
-    for i in range(len(recent) - 3, 1, -1):
-        cur = recent.iloc[i]
-        nxt = recent.iloc[i + 1]
-
-        if float(cur["close"]) > float(cur["open"]):
-            if candle_range(nxt) > candle_range(cur) * 1.2 and float(nxt["close"]) < float(cur["low"]):
-                return {
-                    "label": "Bearish OB",
-                    "type": "bearish",
-                    "zone": (float(cur["low"]), float(cur["high"])),
-                }
-
-    return {"label": "Yok", "type": None, "zone": None}
-
-
-def detect_asia_range_context(df_5m: pd.DataFrame) -> Dict[str, Any]:
-    if df_5m is None or "datetime" not in df_5m.columns or len(df_5m) < 60:
-        return {"label": "Belirsiz", "high": None, "low": None, "sweep": None}
-
-    df = df_5m.copy()
-    df["date"] = df["datetime"].dt.date
-    today = utc_now().date()
-    rows = df[df["date"] == today]
-
-    if rows.empty:
-        return {"label": "Belirsiz", "high": None, "low": None, "sweep": None}
-
-    asia = rows[(rows["datetime"].dt.hour >= 0) & (rows["datetime"].dt.hour < 6)]
-    if asia.empty:
-        return {"label": "Belirsiz", "high": None, "low": None, "sweep": None}
-
-    asia_high = float(asia["high"].max())
-    asia_low = float(asia["low"].min())
-    last = df.iloc[-1]
-
-    sweep = None
-    if float(last["high"]) > asia_high and float(last["close"]) < asia_high:
-        sweep = "asia_high_swept"
-    elif float(last["low"]) < asia_low and float(last["close"]) > asia_low:
-        sweep = "asia_low_swept"
-
-    label = "Asia range tanımlı"
-    if sweep == "asia_high_swept":
-        label = "Asia high sweep"
-    elif sweep == "asia_low_swept":
-        label = "Asia low sweep"
-
-    return {"label": label, "high": asia_high, "low": asia_low, "sweep": sweep}
-
-
-def detect_smt(primary_df: pd.DataFrame, comparison_df: pd.DataFrame) -> Dict[str, Any]:
-    if primary_df is None or comparison_df is None or len(primary_df) < 35 or len(comparison_df) < 35:
-        return {"label": "Yok", "type": None}
-
-    p_prev = primary_df.iloc[:-8].tail(20)
-    c_prev = comparison_df.iloc[:-8].tail(20)
-    p_now = primary_df.tail(8)
-    c_now = comparison_df.tail(8)
-
-    p_hi_prev = float(p_prev["high"].max())
-    c_hi_prev = float(c_prev["high"].max())
-    p_lo_prev = float(p_prev["low"].min())
-    c_lo_prev = float(c_prev["low"].min())
-
-    p_hi_now = float(p_now["high"].max())
-    c_hi_now = float(c_now["high"].max())
-    p_lo_now = float(p_now["low"].min())
-    c_lo_now = float(c_now["low"].min())
-
-    if p_lo_now < p_lo_prev and c_lo_now >= c_lo_prev:
-        return {"label": "Bullish SMT", "type": "bullish"}
-
-    if p_hi_now > p_hi_prev and c_hi_now <= c_hi_prev:
-        return {"label": "Bearish SMT", "type": "bearish"}
-
-    return {"label": "Yok", "type": None}
-
-# =========================================================
-# ANALYSIS ENGINE
-# =========================================================
-def analyze_market(market: str, cache: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None) -> Optional[Dict[str, Any]]:
-    data = cache if cache is not None else build_scan_cache(force_refresh=False)
-
-    if market not in data:
-        return None
-
-    pack = data[market]
-    df_5m = pack["5m"]
-    df_15m = pack["15m"]
-    df_1h = pack["1h"]
-
-    price = round_price(market, df_last_close(df_5m))
-    if price is None:
-        return None
-
-    sess = session_info()
-    news = market_news_block(market)
-
-    htf_bias = detect_htf_bias(df_1h, df_15m)
-    sweep = detect_liquidity_sweep(df_5m)
-    mss = detect_mss(df_5m)
-    choch = detect_choch(df_15m)
-    displacement = detect_displacement(df_5m)
-    fvg = detect_fvg(df_5m)
-    ifvg = detect_ifvg(df_5m)
-    cisd = detect_cisd(df_5m)
-    pd_zone = detect_pd_zone(df_5m)
-    ob = detect_true_order_block(df_5m)
-    asia = detect_asia_range_context(df_5m)
-
-    smt = {"label": "Yok", "type": None}
-    pair = SMT_PAIRS.get(market)
-    if pair and pair in data:
-        smt = detect_smt(df_5m, data[pair]["5m"])
-
-    killzone_pass = sess["killzone"]
-    sweep_pass_long = (sweep["type"] == "bullish") or (asia["sweep"] == "asia_low_swept")
-    sweep_pass_short = (sweep["type"] == "bearish") or (asia["sweep"] == "asia_high_swept")
-    structure_pass_long = (mss["type"] == "bullish") or (choch["type"] == "bullish")
-    structure_pass_short = (mss["type"] == "bearish") or (choch["type"] == "bearish")
-
-    ob_proximity_long = near_zone(price, ob["zone"]) if ob["type"] == "bullish" else False
-    ob_proximity_short = near_zone(price, ob["zone"]) if ob["type"] == "bearish" else False
-
-    smt_long = smt["type"] == "bullish"
-    smt_short = smt["type"] == "bearish"
-
-    retest_pass_long = near_zone(price, ob["zone"]) or near_zone(price, fvg["zone"])
-    retest_pass_short = near_zone(price, ob["zone"]) or near_zone(price, fvg["zone"])
-
+def detect_choch_like(candles: List[Dict[str, Any]]) -> str:
+    if len(candles) < 4:
+        return "Yok"
+
+    a, b, c, d = candles[-4], candles[-3], candles[-2], candles[-1]
+
+    # Basit yaklaşım
+    if d["close"] > b["high"]:
+        return "Bullish CHoCH"
+    if d["close"] < b["low"]:
+        return "Bearish CHoCH"
+    return "Yok"
+
+def detect_mss_like(candles: List[Dict[str, Any]]) -> str:
+    if len(candles) < 6:
+        return "Yok"
+
+    recent_high = max(x["high"] for x in candles[-6:-1])
+    recent_low = min(x["low"] for x in candles[-6:-1])
+    last_close = candles[-1]["close"]
+
+    if last_close > recent_high:
+        return "Bullish MSS"
+    if last_close < recent_low:
+        return "Bearish MSS"
+    return "Yok"
+
+def detect_liquidity_sweep(candles: List[Dict[str, Any]]) -> str:
+    if len(candles) < 6:
+        return "Yok"
+
+    prev_high = max(x["high"] for x in candles[-6:-1])
+    prev_low = min(x["low"] for x in candles[-6:-1])
+    last = candles[-1]
+
+    if last["high"] > prev_high and last["close"] < prev_high:
+        return "Üst likidite sweep"
+    if last["low"] < prev_low and last["close"] > prev_low:
+        return "Alt likidite sweep"
+    return "Yok"
+
+def detect_displacement(candles: List[Dict[str, Any]]) -> str:
+    if len(candles) < 10:
+        return "Zayıf"
+
+    bodies = [abs(c["close"] - c["open"]) for c in candles[-10:-1]]
+    avg_body = sum(bodies) / len(bodies) if bodies else 0
+    last_body = abs(candles[-1]["close"] - candles[-1]["open"])
+
+    if avg_body == 0:
+        return "Zayıf"
+
+    if last_body >= avg_body * 1.8:
+        return "Güçlü"
+    if last_body >= avg_body * 1.2:
+        return "Orta"
+    return "Zayıf"
+
+def detect_premium_discount(candles: List[Dict[str, Any]]) -> str:
+    if len(candles) < 20:
+        return "Nötr"
+
+    recent = candles[-20:]
+    high_ = max(x["high"] for x in recent)
+    low_ = min(x["low"] for x in recent)
+    mid = (high_ + low_) / 2
+    last_close = candles[-1]["close"]
+
+    if last_close > mid:
+        return "Premium"
+    if last_close < mid:
+        return "Discount"
+    return "Nötr"
+
+def detect_fvg(candles: List[Dict[str, Any]]) -> str:
+    if len(candles) < 3:
+        return "Yok"
+
+    a, b, c = candles[-3], candles[-2], candles[-1]
+
+    # Basit FVG yaklaşımı
+    if c["low"] > a["high"]:
+        return "Bullish FVG"
+    if c["high"] < a["low"]:
+        return "Bearish FVG"
+    return "Yok"
+
+def detect_true_order_block(candles: List[Dict[str, Any]]) -> str:
+    if len(candles) < 6:
+        return "Yok"
+
+    last = candles[-1]
+    prev = candles[-2]
+
+    # Basit yaklaşım: güçlü yukarı kırılım öncesi son ayı mumunu / aşağı kırılım öncesi son boğa mumunu işaretle
+    if last["close"] > prev["high"]:
+        for c in reversed(candles[-6:-1]):
+            if c["close"] < c["open"]:
+                return f"Bearish OB ({c['low']:.5f} - {c['high']:.5f})"
+    elif last["close"] < prev["low"]:
+        for c in reversed(candles[-6:-1]):
+            if c["close"] > c["open"]:
+                return f"Bullish OB ({c['low']:.5f} - {c['high']:.5f})"
+
+    return "Yok"
+
+def detect_smt_placeholder(symbol: str) -> str:
+    # SMT için cross-market kıyas gerekir.
+    # Şimdilik placeholder bırakıyoruz.
+    return "Yok"
+
+def score_signal(
+    bias: str,
+    sweep: str,
+    mss: str,
+    choch: str,
+    fvg: str,
+    displacement: str,
+    premium_discount: str
+) -> Dict[str, Any]:
     long_score = 0
     short_score = 0
 
-    if htf_bias == "Yükseliş":
-        long_score += 25
-        short_score -= 8
-    elif htf_bias == "Düşüş":
-        short_score += 25
-        long_score -= 8
-    else:
-        long_score += 8
-        short_score += 8
-
-    if sweep_pass_long:
+    # Bias
+    if bias == "Yükseliş":
         long_score += 20
-    if sweep_pass_short:
+    elif bias == "Düşüş":
         short_score += 20
 
-    if structure_pass_long:
+    # Sweep
+    if sweep == "Alt likidite sweep":
         long_score += 20
-    if structure_pass_short:
+    elif sweep == "Üst likidite sweep":
         short_score += 20
 
-    if killzone_pass:
+    # MSS
+    if mss == "Bullish MSS":
+        long_score += 20
+    elif mss == "Bearish MSS":
+        short_score += 20
+
+    # CHoCH
+    if choch == "Bullish CHoCH":
+        long_score += 15
+    elif choch == "Bearish CHoCH":
+        short_score += 15
+
+    # FVG
+    if fvg == "Bullish FVG":
         long_score += 10
+    elif fvg == "Bearish FVG":
         short_score += 10
 
-    if smt_long:
+    # Displacement
+    if displacement == "Güçlü":
         long_score += 10
-    if smt_short:
         short_score += 10
-
-    if ob_proximity_long:
-        long_score += 10
-    if ob_proximity_short:
-        short_score += 10
-
-    if displacement["strong"]:
+    elif displacement == "Orta":
         long_score += 5
         short_score += 5
 
-    if fvg["type"] == "bullish":
-        long_score += 4
-    elif fvg["type"] == "bearish":
-        short_score += 4
-
-    if ifvg["type"] == "bullish":
-        long_score += 4
-    elif ifvg["type"] == "bearish":
-        short_score += 4
-
-    if cisd["type"] == "bullish":
+    # PD
+    if premium_discount == "Discount":
         long_score += 5
-    elif cisd["type"] == "bearish":
+    elif premium_discount == "Premium":
         short_score += 5
 
-    if pd_zone == "Discount":
-        long_score += 4
-    elif pd_zone == "Premium":
-        short_score += 4
-
-    if retest_pass_long:
-        long_score += 4
-    if retest_pass_short:
-        short_score += 4
-
-    direction = "Bekle"
-    confidence = max(long_score, short_score)
-
-    bias_long_ok = htf_bias in ["Yükseliş", "Nötr"]
-    bias_short_ok = htf_bias in ["Düşüş", "Nötr"]
-
-    trigger_long_ok = killzone_pass or sweep_pass_long
-    trigger_short_ok = killzone_pass or sweep_pass_short
-
-    hard_long = bias_long_ok and structure_pass_long and trigger_long_ok
-    hard_short = bias_short_ok and structure_pass_short and trigger_short_ok
-
-    if not news["blocked"]:
-        if hard_long and long_score >= MIN_SIGNAL_CONFIDENCE and long_score > short_score:
-            direction = "LONG"
-        elif hard_short and short_score >= MIN_SIGNAL_CONFIDENCE and short_score > long_score:
-            direction = "SHORT"
-
-    signal_tier = "Yok"
-    if direction == "LONG":
-        strong_hits = int(smt_long) + int(ob_proximity_long)
-        optional_hits = (
-            int(displacement["strong"])
-            + int(retest_pass_long)
-            + int(fvg["type"] == "bullish")
-            + int(ifvg["type"] == "bullish")
-            + int(cisd["type"] == "bullish")
-        )
-        if strong_hits >= 1 and optional_hits >= 1:
-            signal_tier = "A++"
-        elif strong_hits >= 1:
-            signal_tier = "A+"
-        else:
-            signal_tier = "A"
-
-    elif direction == "SHORT":
-        strong_hits = int(smt_short) + int(ob_proximity_short)
-        optional_hits = (
-            int(displacement["strong"])
-            + int(retest_pass_short)
-            + int(fvg["type"] == "bearish")
-            + int(ifvg["type"] == "bearish")
-            + int(cisd["type"] == "bearish")
-        )
-        if strong_hits >= 1 and optional_hits >= 1:
-            signal_tier = "A++"
-        elif strong_hits >= 1:
-            signal_tier = "A+"
-        else:
-            signal_tier = "A"
-
-    ar = avg_range(df_5m, 14)
-    if ar is None:
-        return None
-
-    if direction == "LONG":
-        entry = price
-        sl = round_price(market, price - ar * DEFAULT_SL_ATR_MULT)
-        tp = round_price(market, price + ar * DEFAULT_TP_ATR_MULT)
-    elif direction == "SHORT":
-        entry = price
-        sl = round_price(market, price + ar * DEFAULT_SL_ATR_MULT)
-        tp = round_price(market, price - ar * DEFAULT_TP_ATR_MULT)
+    if long_score > short_score:
+        direction = "LONG"
+        score = long_score
+    elif short_score > long_score:
+        direction = "SHORT"
+        score = short_score
     else:
-        entry = price
-        sl = "-"
-        tp = "-"
+        direction = "YOK"
+        score = max(long_score, short_score)
 
-    ob_text = ob["label"]
-    if ob["zone"] is not None:
-        ob_text = f"{ob['label']} ({round_price(market, ob['zone'][0])} - {round_price(market, ob['zone'][1])})"
+    quality = "Yok"
+    if score >= 85:
+        quality = "A+"
+    elif score >= 75:
+        quality = "A"
+    elif score >= 65:
+        quality = "B"
 
     return {
-        "market": market,
-        "session": sess["session"],
-        "killzone": sess["killzone"],
-        "price": price,
-        "htf_bias": htf_bias,
-        "sweep": sweep["label"],
-        "mss": mss["label"],
-        "choch": choch["label"],
-        "fvg": fvg["label"],
-        "ifvg": ifvg["label"],
-        "cisd": cisd["label"],
-        "pd_zone": pd_zone,
-        "displacement": displacement["label"],
-        "asia_range": asia["label"],
-        "smt": smt["label"],
-        "true_ob": ob_text,
         "direction": direction,
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "confidence": max(0, min(confidence, 100)),
-        "signal_tier": signal_tier,
-        "scores": {"long": long_score, "short": short_score},
-        "filters": {
-            "killzone": killzone_pass,
-            "sweep": sweep_pass_long if direction == "LONG" else sweep_pass_short if direction == "SHORT" else (sweep_pass_long or sweep_pass_short),
-            "structure": structure_pass_long if direction == "LONG" else structure_pass_short if direction == "SHORT" else (structure_pass_long or structure_pass_short),
-            "trigger": trigger_long_ok if direction == "LONG" else trigger_short_ok if direction == "SHORT" else (trigger_long_ok or trigger_short_ok),
-            "smt": smt_long if direction == "LONG" else smt_short if direction == "SHORT" else (smt_long or smt_short),
-            "ob_proximity": ob_proximity_long if direction == "LONG" else ob_proximity_short if direction == "SHORT" else (ob_proximity_long or ob_proximity_short),
-            "displacement": displacement["strong"],
-            "retest": retest_pass_long if direction == "LONG" else retest_pass_short if direction == "SHORT" else (retest_pass_long or retest_pass_short),
-            "news": not news["blocked"],
-            "news_reason": news["reason"],
-        },
+        "score": score,
+        "quality": quality,
+        "long_score": long_score,
+        "short_score": short_score,
     }
 
-# =========================================================
-# TEXT BUILDERS
-# =========================================================
-def build_manual_text(a: Dict[str, Any]) -> str:
-    return (
-        f"📋 Manuel analiz sonucu\n\n"
-        f"Varlık: {a['market']}\n"
-        f"Seans: {a['session']}\n"
-        f"Killzone: {'Evet' if a['killzone'] else 'Hayır'}\n"
-        f"Anlık Fiyat: {a['price']}\n"
-        f"HTF Bias: {a['htf_bias']}\n"
-        f"Likidite Sweep: {a['sweep']}\n"
-        f"MSS: {a['mss']}\n"
-        f"CHoCH: {a['choch']}\n"
-        f"FVG: {a['fvg']}\n"
-        f"iFVG: {a['ifvg']}\n"
-        f"CISD: {a['cisd']}\n"
-        f"Premium/Discount: {a['pd_zone']}\n"
-        f"Displacement: {a['displacement']}\n"
-        f"Asia Range: {a['asia_range']}\n"
-        f"SMT: {a['smt']}\n"
-        f"True Order Block: {a['true_ob']}\n"
-        f"Skor: {a['confidence']}/100\n"
-        f"Sinyal Kalitesi: {a['signal_tier']}\n"
-        f"Killzone filtresi: {'Geçti' if a['filters']['killzone'] else 'Kaldı'}\n"
-        f"Sweep filtresi: {'Geçti' if a['filters']['sweep'] else 'Kaldı'}\n"
-        f"Yapı filtresi: {'Geçti' if a['filters']['structure'] else 'Kaldı'}\n"
-        f"Killzone/Sweep tetik filtresi: {'Geçti' if a['filters']['trigger'] else 'Kaldı'}\n"
-        f"SMT teyidi: {'Var' if a['filters']['smt'] else 'Yok'}\n"
-        f"OB proximity teyidi: {'Var' if a['filters']['ob_proximity'] else 'Yok'}\n"
-        f"Displacement filtresi: {'Geçti' if a['filters']['displacement'] else 'Kaldı'}\n"
-        f"Retest filtresi: {'Geçti' if a['filters']['retest'] else 'Kaldı'}\n"
-        f"News filtresi: {'Geçti' if a['filters']['news'] else 'Kaldı'}\n"
-        f"News nedeni: {a['filters']['news_reason']}\n"
-        f"Durum: {'Sinyal var' if a['direction'] != 'Bekle' else 'Şu an net setup yok'}\n"
-        f"Not: Bot şartlar tamam değilse sessiz kalır."
+def build_trade_levels(candles: List[Dict[str, Any]], direction: str) -> Dict[str, Optional[float]]:
+    if len(candles) < 10 or direction not in ("LONG", "SHORT"):
+        return {"entry": None, "sl": None, "tp": None}
+
+    last = candles[-1]
+    recent = candles[-10:]
+
+    recent_high = max(x["high"] for x in recent)
+    recent_low = min(x["low"] for x in recent)
+    price = last["close"]
+
+    if direction == "LONG":
+        sl = recent_low
+        risk = price - sl
+        if risk <= 0:
+            return {"entry": price, "sl": None, "tp": None}
+        tp = price + risk * 2
+        return {"entry": price, "sl": sl, "tp": tp}
+
+    sl = recent_high
+    risk = sl - price
+    if risk <= 0:
+        return {"entry": price, "sl": None, "tp": None}
+    tp = price - risk * 2
+    return {"entry": price, "sl": sl, "tp": tp}
+
+def analyze_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    raw = fetch_twelvedata_series(symbol)
+    if not raw:
+        return None
+
+    candles = build_candles(raw)
+    if len(candles) < 20:
+        print(f"{symbol} yeterli candle yok.")
+        return None
+
+    last_price = candles[-1]["close"]
+    bias = detect_bias(candles)
+    sweep = detect_liquidity_sweep(candles)
+    mss = detect_mss_like(candles)
+    choch = detect_choch_like(candles)
+    fvg = detect_fvg(candles)
+    displacement = detect_displacement(candles)
+    premium_discount = detect_premium_discount(candles)
+    smt = detect_smt_placeholder(symbol)
+    ob = detect_true_order_block(candles)
+
+    score_data = score_signal(
+        bias=bias,
+        sweep=sweep,
+        mss=mss,
+        choch=choch,
+        fvg=fvg,
+        displacement=displacement,
+        premium_discount=premium_discount,
     )
 
+    levels = build_trade_levels(candles, score_data["direction"])
 
-def build_signal_text(a: Dict[str, Any]) -> str:
-    return (
-        f"🚨 ANALİZ + SİNYAL RAPORU\n\n"
-        f"Varlık: {a['market']}\n"
-        f"Seans: {a['session']}\n"
-        f"Killzone: {'Evet' if a['killzone'] else 'Hayır'}\n"
-        f"Anlık Fiyat: {a['price']}\n\n"
-        f"HTF Bias: {a['htf_bias']}\n"
-        f"Likidite Sweep: {a['sweep']}\n"
-        f"MSS: {a['mss']}\n"
-        f"CHoCH: {a['choch']}\n"
-        f"FVG: {a['fvg']}\n"
-        f"iFVG: {a['ifvg']}\n"
-        f"CISD: {a['cisd']}\n"
-        f"Premium/Discount: {a['pd_zone']}\n"
-        f"Displacement: {a['displacement']}\n"
-        f"Asia Range: {a['asia_range']}\n"
-        f"SMT: {a['smt']}\n"
-        f"True Order Block: {a['true_ob']}\n\n"
-        f"İşlem Yönü: {a['direction']}\n"
-        f"Giriş: {a['entry']}\n"
-        f"Zarar Durdur: {a['sl']}\n"
-        f"Kar Al: {a['tp']}\n"
-        f"Güven Skoru: {a['confidence']}/100\n"
-        f"Sinyal Kalitesi: {a['signal_tier']}\n"
-        f"Long/Short Skor: {a['scores']['long']} / {a['scores']['short']}\n"
-        f"Killzone filtresi: {'Geçti' if a['filters']['killzone'] else 'Kaldı'}\n"
-        f"Sweep filtresi: {'Geçti' if a['filters']['sweep'] else 'Kaldı'}\n"
-        f"Yapı filtresi: {'Geçti' if a['filters']['structure'] else 'Kaldı'}\n"
-        f"Killzone/Sweep tetik filtresi: {'Geçti' if a['filters']['trigger'] else 'Kaldı'}\n"
-        f"SMT teyidi: {'Var' if a['filters']['smt'] else 'Yok'}\n"
-        f"OB proximity teyidi: {'Var' if a['filters']['ob_proximity'] else 'Yok'}\n"
-        f"Displacement filtresi: {'Geçti' if a['filters']['displacement'] else 'Kaldı'}\n"
-        f"Retest filtresi: {'Geçti' if a['filters']['retest'] else 'Kaldı'}\n"
-        f"News filtresi: {'Geçti' if a['filters']['news'] else 'Kaldı'}\n"
-        f"News nedeni: {a['filters']['news_reason']}\n\n"
-        f"⚠️ Not: Bu sinyal otomatik tarama sonucudur. Son kararı yine sen ver."
-    )
-
-
-def build_tp_text(sig: Dict[str, Any], current_price: float) -> str:
-    return (
-        f"✅ TP oldu\n\n"
-        f"Varlık: {sig['market']}\n"
-        f"Yön: {sig['direction']}\n"
-        f"Giriş: {sig['entry']}\n"
-        f"TP: {sig['tp']}\n"
-        f"Anlık Fiyat: {current_price}"
-    )
-
-
-def build_sl_text(sig: Dict[str, Any], current_price: float) -> str:
-    return (
-        f"❌ SL oldu\n\n"
-        f"Varlık: {sig['market']}\n"
-        f"Yön: {sig['direction']}\n"
-        f"Giriş: {sig['entry']}\n"
-        f"SL: {sig['sl']}\n"
-        f"Anlık Fiyat: {current_price}"
-    )
-
-# =========================================================
-# SIGNAL MEMORY
-# =========================================================
-def signal_key(a: Dict[str, Any]) -> str:
-    return f"{a['market']}|{a['direction']}|{a['entry']}|{a['sl']}|{a['tp']}"
-
-
-def signal_recently_sent(market: str, key: str) -> bool:
-    recent = STATE["recent_signal_keys"].get(market)
-    if not recent:
-        return False
-
-    saved_key = recent.get("key")
-    ts = recent.get("ts")
-
-    if saved_key != key or not ts:
-        return False
-
-    try:
-        dt = datetime.fromisoformat(ts)
-        if utc_now().replace(tzinfo=None) - dt < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES):
-            return True
-    except Exception:
-        return False
-
-    return False
-
-
-def remember_signal(market: str, key: str) -> None:
-    STATE["recent_signal_keys"][market] = {
-        "key": key,
-        "ts": utc_now().replace(tzinfo=None).isoformat()
+    result = {
+        "symbol": symbol,
+        "session": "Otomatik Tarama",
+        "killzone": "Evet" if datetime.now().hour in [9, 10, 11, 14, 15, 16] else "Hayır",
+        "price": last_price,
+        "htf_bias": bias,
+        "liquidity_sweep": sweep,
+        "mss": mss,
+        "choch": choch,
+        "fvg": fvg,
+        "premium_discount": premium_discount,
+        "displacement": displacement,
+        "smt": smt,
+        "true_order_block": ob,
+        "direction": score_data["direction"],
+        "entry": levels["entry"],
+        "sl": levels["sl"],
+        "tp": levels["tp"],
+        "score": score_data["score"],
+        "quality": score_data["quality"],
+        "long_score": score_data["long_score"],
+        "short_score": score_data["short_score"],
+        "raw_status": raw.get("status", "unknown"),
+        "last_candle_time": candles[-1]["datetime"],
     }
-    save_state()
+
+    return result
+
+def should_send_signal(result: Dict[str, Any]) -> bool:
+    symbol = result["symbol"]
+    direction = result["direction"]
+    score = result["score"]
+    quality = result["quality"]
+
+    if direction == "YOK":
+        return False
+
+    if score < MIN_SIGNAL_SCORE:
+        return False
+
+    if quality not in ("A", "A+"):
+        return False
+
+    active = STATE["active_signals"].get(symbol)
+    if not active:
+        return True
+
+    same_direction = active.get("direction") == direction
+    cooldown_ok = minutes_since(active.get("sent_at")) >= SIGNAL_COOLDOWN_MINUTES
+
+    if same_direction and not cooldown_ok:
+        return False
+
+    return True
+
+def format_signal_message(result: Dict[str, Any]) -> str:
+    entry = f"{result['entry']:.5f}" if result["entry"] is not None else "Yok"
+    sl = f"{result['sl']:.5f}" if result["sl"] is not None else "Yok"
+    tp = f"{result['tp']:.5f}" if result["tp"] is not None else "Yok"
+
+    return (
+        "🚨 ANALİZ + SİNYAL RAPORU\n\n"
+        f"Varlık: {result['symbol']}\n"
+        f"Seans: {result['session']}\n"
+        f"Killzone: {result['killzone']}\n"
+        f"Anlık Fiyat: {result['price']:.5f}\n\n"
+        f"HTF Bias: {result['htf_bias']}\n"
+        f"Likidite Sweep: {result['liquidity_sweep']}\n"
+        f"MSS: {result['mss']}\n"
+        f"CHoCH: {result['choch']}\n"
+        f"FVG: {result['fvg']}\n"
+        f"Premium/Discount: {result['premium_discount']}\n"
+        f"Displacement: {result['displacement']}\n"
+        f"SMT: {result['smt']}\n"
+        f"True Order Block: {result['true_order_block']}\n\n"
+        f"İşlem Yönü: {result['direction']}\n"
+        f"Giriş: {entry}\n"
+        f"Zarar Durdur: {sl}\n"
+        f"Kar Al: {tp}\n"
+        f"Güven Skoru: {result['score']}/100\n"
+        f"Sinyal Kalitesi: {result['quality']}\n"
+        f"Long/Short Skor: {result['long_score']} / {result['short_score']}\n\n"
+        f"Son Mum Zamanı: {result['last_candle_time']}\n"
+        "⚠️ Not: Bu sinyal otomatik tarama ile üretildi."
+    )
 
 # =========================================================
-# ACTIVE SIGNAL TRACKER
+# SCANNER
 # =========================================================
-def check_active_signals(cache: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None) -> None:
-    active = STATE["active_signals"]
-    if not isinstance(active, dict):
-        STATE["active_signals"] = {}
-        active = STATE["active_signals"]
+def scan_once() -> None:
+    with scan_lock:
+        print("Tarama başladı...")
+        STATE["last_scan_at"] = now_utc_iso()
 
-    if cache is None:
-        cache = build_scan_cache(force_refresh=False)
+        for symbol in MARKETS:
+            try:
+                result = analyze_symbol(symbol)
 
-    remove_list: List[str] = []
+                if not result:
+                    print(f"{symbol} analiz üretilemedi.")
+                    continue
 
-    for market, sig in active.items():
-        if market not in cache:
-            continue
+                print(f"{symbol} -> yön: {result['direction']}, skor: {result['score']}")
 
-        current_price = round_price(market, df_last_close(cache[market]["5m"]))
-        if current_price is None:
-            continue
+                if should_send_signal(result):
+                    msg = format_signal_message(result)
+                    sent = send_telegram_message(msg)
 
-        reply_id = sig.get("message_id")
+                    if sent:
+                        STATE["active_signals"][symbol] = {
+                            "direction": result["direction"],
+                            "score": result["score"],
+                            "sent_at": now_utc_iso(),
+                            "entry": result["entry"],
+                            "sl": result["sl"],
+                            "tp": result["tp"],
+                        }
+                        save_state()
+                        print(f"{symbol} sinyal gönderildi.")
+                else:
+                    print(f"{symbol} için sinyal yok.")
 
-        if sig["direction"] == "LONG":
-            if current_price >= sig["tp"]:
-                send_telegram_message(build_tp_text(sig, current_price), reply_id)
-                remove_list.append(market)
-            elif current_price <= sig["sl"]:
-                send_telegram_message(build_sl_text(sig, current_price), reply_id)
-                remove_list.append(market)
+            except Exception as e:
+                print(f"{symbol} scan hatası: {e}")
 
-        elif sig["direction"] == "SHORT":
-            if current_price <= sig["tp"]:
-                send_telegram_message(build_tp_text(sig, current_price), reply_id)
-                remove_list.append(market)
-            elif current_price >= sig["sl"]:
-                send_telegram_message(build_sl_text(sig, current_price), reply_id)
-                remove_list.append(market)
-
-    for market in remove_list:
-        STATE["active_signals"].pop(market, None)
-
-    if remove_list:
         save_state()
+        print("Tarama bitti.")
 
-# =========================================================
-# SCANNER LOOP
-# =========================================================
 def scanner_loop() -> None:
     while True:
         try:
-            cache = build_scan_cache(force_refresh=True)
-            check_active_signals(cache=cache)
-
-            for market in MARKETS.keys():
-                if market in STATE["active_signals"]:
-                    continue
-
-                a = analyze_market(market, cache=cache)
-                if a is None:
-                    continue
-
-                if a["direction"] == "Bekle":
-                    continue
-
-                key = signal_key(a)
-                if signal_recently_sent(market, key):
-                    continue
-
-                result = send_telegram_message(build_signal_text(a))
-                message_id = None
-                if isinstance(result, dict):
-                    message_id = result.get("result", {}).get("message_id")
-
-                STATE["active_signals"][market] = {
-                    "market": a["market"],
-                    "direction": a["direction"],
-                    "entry": a["entry"],
-                    "sl": a["sl"],
-                    "tp": a["tp"],
-                    "message_id": message_id,
-                    "created_at": utc_now().replace(tzinfo=None).isoformat(),
-                }
-
-                remember_signal(market, key)
-                time.sleep(0.25)
-
-            STATE["last_scan_at"] = utc_now().replace(tzinfo=None).isoformat()
-            save_state()
-
-            cache.clear()
-            gc.collect()
-            time.sleep(SCAN_INTERVAL_SECONDS)
-
-        except Exception:
-            gc.collect()
-            time.sleep(SCAN_INTERVAL_SECONDS)
+            scan_once()
+        except Exception as e:
+            print(f"scanner_loop genel hata: {e}")
+        time.sleep(SCAN_INTERVAL_SECONDS)
 
 # =========================================================
-# ROUTES
+# FLASK ROUTES
 # =========================================================
-@app.route("/", methods=["GET"])
+@app.route("/")
 def home():
     return jsonify({
         "ok": True,
-        "status": "Trade Konseyi optimize sürüm aktif",
-        "markets": list(MARKETS.keys()),
-        "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
-        "active_signals_count": len(STATE["active_signals"]),
+        "service": "trade-konseyi",
+        "message": "Service is running",
+        "last_scan_at": STATE.get("last_scan_at"),
+        "markets": MARKETS,
     })
 
-
-@app.route("/status", methods=["GET"])
-def status():
-    text = (
-        f"✅ Sistem durumu\n\n"
-        f"Seans: {session_info()['session']}\n"
-        f"Aktif sinyal sayısı: {len(STATE['active_signals'])}\n"
-        f"İzlenen market sayısı: {len(MARKETS)}\n"
-        f"Son tarama: {STATE.get('last_scan_at')}"
-    )
-    tg = send_telegram_message(text)
-    return jsonify({"ok": True, "telegram_result": tg})
-
-
-@app.route("/manual/<market>", methods=["GET"])
-def manual_market(market: str):
-    market = market.upper()
-    if market not in MARKETS:
-        return jsonify({"ok": False, "error": "Geçersiz market"}), 400
-
-    cache = build_scan_cache(force_refresh=True)
-    a = analyze_market(market, cache=cache)
-    if a is None:
-        return jsonify({"ok": False, "error": "Veri alınamadı"}), 500
-
-    if a["direction"] == "Bekle":
-        tg = send_telegram_message(build_manual_text(a))
-    else:
-        tg = send_telegram_message(build_signal_text(a))
-
-    cache.clear()
-    gc.collect()
-    return jsonify({"ok": True, "analysis": a, "telegram_result": tg})
-
-
-@app.route("/manual-all", methods=["GET"])
-def manual_all():
-    cache = build_scan_cache(force_refresh=True)
-    results = []
-    sent_count = 0
-
-    for market in MARKETS.keys():
-        try:
-            a = analyze_market(market, cache=cache)
-            if a is None:
-                results.append({"market": market, "status": "error", "detail": "Veri alınamadı"})
-                continue
-
-            if a["direction"] == "Bekle":
-                tg = send_telegram_message(build_manual_text(a))
-            else:
-                tg = send_telegram_message(build_signal_text(a))
-
-            sent_count += 1
-            results.append({
-                "market": market,
-                "status": "sent",
-                "direction": a["direction"],
-                "confidence": a["confidence"],
-                "telegram_ok": tg.get("ok", False) if isinstance(tg, dict) else False,
-            })
-            time.sleep(0.25)
-
-        except Exception as e:
-            results.append({"market": market, "status": "error", "detail": str(e)})
-
-    cache.clear()
-    gc.collect()
-
+@app.route("/health")
+def health():
     return jsonify({
         "ok": True,
-        "message": f"{sent_count} market Telegram'a gönderildi.",
-        "results": results,
+        "active_signals": STATE.get("active_signals", {}),
+        "last_scan_at": STATE.get("last_scan_at"),
+        "watched_markets": len(MARKETS),
     })
 
+@app.route("/scan-now")
+def scan_now():
+    try:
+        scan_once()
+        return jsonify({"ok": True, "message": "Manual scan completed"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/active-signals", methods=["GET"])
-def active_signals():
-    return jsonify({"ok": True, "active_signals": STATE["active_signals"]})
+@app.route("/analyze/<path:symbol>")
+def analyze_route(symbol: str):
+    symbol = symbol.strip()
+    result = analyze_symbol(symbol)
+    if not result:
+        return jsonify({"ok": False, "error": "analysis failed"}), 400
+    return jsonify({"ok": True, "result": result})
 
 # =========================================================
 # STARTUP
 # =========================================================
-def start_background() -> None:
-    load_state()
-    init_tv()
-    t = threading.Thread(target=scanner_loop, daemon=True)
-    t.start()
-
-
-start_background()
+def validate_env() -> None:
+    print(f"TWELVEDATA_API_KEY dolu mu: {'evet' if bool(TWELVEDATA_API_KEY) else 'hayır'}")
+    print(f"TELEGRAM_BOT_TOKEN dolu mu: {'evet' if bool(TELEGRAM_BOT_TOKEN) else 'hayır'}")
+    print(f"TELEGRAM_CHAT_ID dolu mu: {'evet' if bool(TELEGRAM_CHAT_ID) else 'hayır'}")
 
 if __name__ == "__main__":
     load_state()
-    init_tv()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    validate_env()
+
+    scanner_thread = threading.Thread(target=scanner_loop, daemon=True)
+    scanner_thread.start()
+
+    app.run(host="0.0.0.0", port=PORT, debug=False)
