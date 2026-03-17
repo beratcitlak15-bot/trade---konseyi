@@ -20,12 +20,17 @@ PORT = int(os.getenv("PORT", "10000"))
 # =========================================================
 # SETTINGS
 # =========================================================
-SCAN_INTERVAL_SECONDS = 600
+SCAN_INTERVAL_SECONDS = 600   # 10 dakika
 TIMEFRAME = "15min"
 OUTPUTSIZE = 60
-MIN_SIGNAL_SCORE = 75
+
+# Minimum kalite eşiği
+MIN_SIGNAL_SCORE = 70
+
+# Telegram spam koruması
 SIGNAL_COOLDOWN_MINUTES = 45
 
+# İzlenecek 5 parite
 MARKETS = [
     "EUR/USD",
     "GBP/USD",
@@ -38,8 +43,8 @@ STATE: Dict[str, Any] = {
     "service_started_at": datetime.now(timezone.utc).isoformat(),
     "last_scan_at": None,
     "last_results": {},
-    "scanner_started": False,
     "active_signals": {},
+    "scanner_started": False,
 }
 
 scan_lock = threading.Lock()
@@ -62,12 +67,11 @@ def safe_float(value: Any) -> Optional[float]:
 def minutes_since(iso_dt: Optional[str]) -> float:
     if not iso_dt:
         return 999999.0
-
     try:
-        dt = datetime.fromisoformat(iso_dt)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        delta = datetime.now(timezone.utc) - dt
+        then = datetime.fromisoformat(iso_dt)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - then
         return delta.total_seconds() / 60.0
     except Exception:
         return 999999.0
@@ -87,15 +91,31 @@ def send_telegram_message(text: str) -> bool:
     try:
         response = requests.post(url, json=payload, timeout=20)
         print(f"Telegram status: {response.status_code}")
-
         if response.status_code != 200:
             print(f"Telegram response: {response.text}")
-            return False
-
-        return True
+        return response.status_code == 200
     except Exception as e:
         print(f"Telegram gönderim hatası: {e}")
         return False
+
+
+def get_killzone_label() -> str:
+    """
+    Türkiye saati mantığına göre basit killzone etiketi.
+    İstersen sonra daha hassas saat blokları ekleriz.
+    """
+    hour = datetime.now().hour
+
+    # Basit sınıflama
+    if 10 <= hour <= 12:
+        return "London Killzone"
+    if 15 <= hour <= 17:
+        return "New York Killzone"
+    return "Killzone Dışı"
+
+
+def is_killzone_active() -> bool:
+    return get_killzone_label() != "Killzone Dışı"
 
 
 # =========================================================
@@ -128,7 +148,7 @@ def fetch_twelvedata_series(symbol: str) -> Optional[Dict[str, Any]]:
             return None
 
         if "values" not in data or not data["values"]:
-            print(f"{symbol} veri boş geldi.")
+            print(f"{symbol} veri boş.")
             return None
 
         return data
@@ -162,7 +182,7 @@ def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
             "close": c,
         })
 
-    # TwelveData genelde en yeniyi üstte verir, analiz için terse çeviriyoruz
+    # TwelveData çoğu zaman en yeni mumu üstte verir.
     candles.reverse()
     return candles
 
@@ -186,7 +206,7 @@ def detect_choch_like(candles: List[Dict[str, Any]]) -> str:
     if len(candles) < 4:
         return "Yok"
 
-    _, b, _, d = candles[-4], candles[-3], candles[-2], candles[-1]
+    a, b, c, d = candles[-4], candles[-3], candles[-2], candles[-1]
 
     if d["close"] > b["high"]:
         return "Bullish CHoCH"
@@ -264,7 +284,7 @@ def detect_fvg(candles: List[Dict[str, Any]]) -> str:
     if len(candles) < 3:
         return "Yok"
 
-    a, _, c = candles[-3], candles[-2], candles[-1]
+    a, b, c = candles[-3], candles[-2], candles[-1]
 
     if c["low"] > a["high"]:
         return "Bullish FVG"
@@ -273,67 +293,99 @@ def detect_fvg(candles: List[Dict[str, Any]]) -> str:
     return "Yok"
 
 
-def score_signal(
-    bias: str,
+def detect_true_order_block(candles: List[Dict[str, Any]], direction: str) -> str:
+    if len(candles) < 8:
+        return "Yok"
+
+    lookback = candles[-8:-1]
+
+    if direction == "LONG":
+        for c in reversed(lookback):
+            if c["close"] < c["open"]:
+                return f"Bullish OB adayı ({c['low']:.5f} - {c['high']:.5f})"
+    elif direction == "SHORT":
+        for c in reversed(lookback):
+            if c["close"] > c["open"]:
+                return f"Bearish OB adayı ({c['low']:.5f} - {c['high']:.5f})"
+
+    return "Yok"
+
+
+def detect_smt_placeholder(symbol: str) -> str:
+    """
+    Şimdilik placeholder.
+    Sonra cross-market kıyas ile gerçek SMT kurabiliriz.
+    """
+    return "Yok"
+
+
+def has_required_long_conditions(
     sweep: str,
     mss: str,
     choch: str,
-    fvg: str,
     displacement: str,
+) -> bool:
+    return (
+        sweep == "Alt likidite sweep"
+        and (mss == "Bullish MSS" or choch == "Bullish CHoCH")
+        and displacement in ("Orta", "Güçlü")
+    )
+
+
+def has_required_short_conditions(
+    sweep: str,
+    mss: str,
+    choch: str,
+    displacement: str,
+) -> bool:
+    return (
+        sweep == "Üst likidite sweep"
+        and (mss == "Bearish MSS" or choch == "Bearish CHoCH")
+        and displacement in ("Orta", "Güçlü")
+    )
+
+
+def score_signal(
+    direction: str,
+    bias: str,
+    fvg: str,
     premium_discount: str,
+    smt: str,
+    killzone_active: bool,
+    true_order_block: str,
 ) -> Dict[str, Any]:
-    long_score = 0
-    short_score = 0
-
-    if bias == "Yükseliş":
-        long_score += 20
-    elif bias == "Düşüş":
-        short_score += 20
-
-    if sweep == "Alt likidite sweep":
-        long_score += 20
-    elif sweep == "Üst likidite sweep":
-        short_score += 20
-
-    if mss == "Bullish MSS":
-        long_score += 20
-    elif mss == "Bearish MSS":
-        short_score += 20
-
-    if choch == "Bullish CHoCH":
-        long_score += 15
-    elif choch == "Bearish CHoCH":
-        short_score += 15
-
-    if fvg == "Bullish FVG":
-        long_score += 10
-    elif fvg == "Bearish FVG":
-        short_score += 10
-
-    if displacement == "Güçlü":
-        long_score += 10
-        short_score += 10
-    elif displacement == "Orta":
-        long_score += 5
-        short_score += 5
-
-    if premium_discount == "Discount":
-        long_score += 5
-    elif premium_discount == "Premium":
-        short_score += 5
-
-    if long_score > short_score:
-        direction = "LONG"
-        score = long_score
-    elif short_score > long_score:
-        direction = "SHORT"
-        score = short_score
-    else:
-        direction = "YOK"
-        score = max(long_score, short_score)
-
+    score = 0
     quality = "Yok"
-    if score >= 85:
+
+    # Ara filtreler
+    if direction == "LONG":
+        if bias == "Yükseliş":
+            score += 20
+        if fvg == "Bullish FVG":
+            score += 15
+        if premium_discount == "Discount":
+            score += 15
+
+    elif direction == "SHORT":
+        if bias == "Düşüş":
+            score += 20
+        if fvg == "Bearish FVG":
+            score += 15
+        if premium_discount == "Premium":
+            score += 15
+
+    # Opsiyoneller
+    if killzone_active:
+        score += 10
+    if smt != "Yok":
+        score += 10
+    if true_order_block != "Yok":
+        score += 10
+
+    # Taban puan: zorunlular sağlandıysa başlangıç puanı
+    score += 40
+
+    if score >= 90:
         quality = "A+"
     elif score >= 75:
         quality = "A"
@@ -341,11 +393,8 @@ def score_signal(
         quality = "B"
 
     return {
-        "direction": direction,
         "score": score,
         "quality": quality,
-        "long_score": long_score,
-        "short_score": short_score,
     }
 
 
@@ -383,29 +432,74 @@ def analyze_symbol(symbol: str) -> Optional[Dict[str, Any]]:
 
     candles = build_candles(raw)
     if len(candles) < 20:
-        print(f"{symbol} yeterli candle yok.")
+        print(f"{symbol} için yeterli mum yok.")
         return None
 
     last_price = candles[-1]["close"]
+
     bias = detect_bias(candles)
     sweep = detect_liquidity_sweep(candles)
     mss = detect_mss_like(candles)
     choch = detect_choch_like(candles)
-    fvg = detect_fvg(candles)
     displacement = detect_displacement(candles)
+    fvg = detect_fvg(candles)
     premium_discount = detect_premium_discount(candles)
 
-    score_data = score_signal(
+    killzone_label = get_killzone_label()
+    killzone_active = is_killzone_active()
+    smt = detect_smt_placeholder(symbol)
+
+    direction = "YOK"
+
+    # =====================================================
+    # 3 KATMANLI MANTIK
+    # 1) ZORUNLULAR
+    # =====================================================
+    if has_required_long_conditions(sweep, mss, choch, displacement):
+        direction = "LONG"
+    elif has_required_short_conditions(sweep, mss, choch, displacement):
+        direction = "SHORT"
+    else:
+        return {
+            "symbol": symbol,
+            "price": last_price,
+            "htf_bias": bias,
+            "liquidity_sweep": sweep,
+            "mss": mss,
+            "choch": choch,
+            "fvg": fvg,
+            "premium_discount": premium_discount,
+            "displacement": displacement,
+            "smt": smt,
+            "killzone": killzone_label,
+            "true_order_block": "Yok",
+            "direction": "YOK",
+            "entry": None,
+            "sl": None,
+            "tp": None,
+            "score": 0,
+            "quality": "Yok",
+            "long_score": 0,
+            "short_score": 0,
+            "last_candle_time": candles[-1]["datetime"],
+            "reason": "Zorunlu filtreler sağlanmadı",
+        }
+
+    true_order_block = detect_true_order_block(candles, direction)
+    levels = build_trade_levels(candles, direction)
+
+    scored = score_signal(
+        direction=direction,
         bias=bias,
-        sweep=sweep,
-        mss=mss,
-        choch=choch,
         fvg=fvg,
-        displacement=displacement,
         premium_discount=premium_discount,
+        smt=smt,
+        killzone_active=killzone_active,
+        true_order_block=true_order_block,
     )
 
-    levels = build_trade_levels(candles, score_data["direction"])
+    long_score = scored["score"] if direction == "LONG" else 0
+    short_score = scored["score"] if direction == "SHORT" else 0
 
     return {
         "symbol": symbol,
@@ -417,16 +511,20 @@ def analyze_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         "fvg": fvg,
         "premium_discount": premium_discount,
         "displacement": displacement,
-        "direction": score_data["direction"],
+        "smt": smt,
+        "killzone": killzone_label,
+        "true_order_block": true_order_block,
+        "direction": direction,
         "entry": levels["entry"],
         "sl": levels["sl"],
         "tp": levels["tp"],
-        "score": score_data["score"],
-        "quality": score_data["quality"],
-        "long_score": score_data["long_score"],
-        "short_score": score_data["short_score"],
+        "score": scored["score"],
+        "quality": scored["quality"],
+        "long_score": long_score,
+        "short_score": short_score,
         "last_candle_time": candles[-1]["datetime"],
-    }
+        "reason": "Zorunlu filtreler sağlandı",
+    } 
 
 def format_signal_message(result: Dict[str, Any]) -> str:
     entry = f"{result['entry']:.5f}" if result["entry"] is not None else "Yok"
@@ -436,22 +534,26 @@ def format_signal_message(result: Dict[str, Any]) -> str:
     return (
         "🚨 ANALİZ + SİNYAL RAPORU\n\n"
         f"Varlık: {result['symbol']}\n"
-        f"Anlık Fiyat: {result['price']:.5f}\n\n"
+        f"Anlık Fiyat: {result['price']:.5f}\n"
+        f"Killzone: {result['killzone']}\n\n"
         f"HTF Bias: {result['htf_bias']}\n"
         f"Likidite Sweep: {result['liquidity_sweep']}\n"
         f"MSS: {result['mss']}\n"
         f"CHoCH: {result['choch']}\n"
         f"FVG: {result['fvg']}\n"
         f"Premium/Discount: {result['premium_discount']}\n"
-        f"Displacement: {result['displacement']}\n\n"
+        f"Displacement: {result['displacement']}\n"
+        f"SMT: {result['smt']}\n"
+        f"True Order Block: {result['true_order_block']}\n\n"
         f"İşlem Yönü: {result['direction']}\n"
         f"Giriş: {entry}\n"
         f"Zarar Durdur: {sl}\n"
         f"Kar Al: {tp}\n"
         f"Güven Skoru: {result['score']}/100\n"
         f"Sinyal Kalitesi: {result['quality']}\n"
-        f"Long/Short Skor: {result['long_score']} / {result['short_score']}\n\n"
-        f"Son Mum Zamanı: {result['last_candle_time']}"
+        f"Long/Short Skor: {result['long_score']} / {result['short_score']}\n"
+        f"Son Mum Zamanı: {result['last_candle_time']}\n"
+        f"Not: {result.get('reason', 'Yok')}"
     )
 
 
@@ -505,7 +607,10 @@ def scan_once() -> Dict[str, Any]:
                 results[symbol] = {"ok": True, "result": result}
                 STATE["last_results"][symbol] = result
 
-                print(f"{symbol} -> yön: {result['direction']}, skor: {result['score']}")
+                print(
+                    f"{symbol} -> yön: {result['direction']}, "
+                    f"skor: {result['score']}, kalite: {result['quality']}"
+                )
 
                 if should_send_signal(result):
                     msg = format_signal_message(result)
@@ -515,6 +620,7 @@ def scan_once() -> Dict[str, Any]:
                         STATE["active_signals"][symbol] = {
                             "direction": result["direction"],
                             "score": result["score"],
+                            "quality": result["quality"],
                             "sent_at": now_utc_iso(),
                             "entry": result["entry"],
                             "sl": result["sl"],
@@ -535,7 +641,7 @@ def scan_once() -> Dict[str, Any]:
 
 
 def scanner_loop() -> None:
-    # Uygulama ayağa kalktıktan sonra küçük gecikme
+    # Uygulama kalktıktan sonra kısa bekleme
     time.sleep(5)
 
     while True:
