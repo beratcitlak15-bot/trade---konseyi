@@ -340,12 +340,90 @@ def detect_true_order_block(candles: List[Dict[str, Any]], direction: str) -> st
             if candle["close"] > candle["open"]:
                 return f"Bearish OB adayı ({candle['low']:.5f} - {candle['high']:.5f})"
 
+    
+
+def get_recent_swing_high(candles: List[Dict[str, Any]], lookback: int = 6) -> Optional[float]:
+    if len(candles) < lookback:
+        return None
+    return max(x["high"] for x in candles[-lookback:])
+
+
+def get_recent_swing_low(candles: List[Dict[str, Any]], lookback: int = 6) -> Optional[float]:
+    if len(candles) < lookback:
+        return None
+    return min(x["low"] for x in candles[-lookback:])
+
+
+def detect_pair_smt(
+    candles_a: List[Dict[str, Any]],
+    candles_b: List[Dict[str, Any]],
+    lookback: int = 6,
+) -> str:
+    """
+    Basit SMT mantığı:
+    - A yeni high yapıyor, B yapmıyorsa -> Bearish SMT
+    - A yeni low yapıyor, B yapmıyorsa -> Bullish SMT
+    """
+    if len(candles_a) < lookback + 1 or len(candles_b) < lookback + 1:
+        return "Yok"
+
+    prev_high_a = max(x["high"] for x in candles_a[-(lookback + 1):-1])
+    prev_low_a = min(x["low"] for x in candles_a[-(lookback + 1):-1])
+
+    prev_high_b = max(x["high"] for x in candles_b[-(lookback + 1):-1])
+    prev_low_b = min(x["low"] for x in candles_b[-(lookback + 1):-1])
+
+    last_a = candles_a[-1]
+    last_b = candles_b[-1]
+
+    a_makes_higher_high = last_a["high"] > prev_high_a
+    b_makes_higher_high = last_b["high"] > prev_high_b
+
+    a_makes_lower_low = last_a["low"] < prev_low_a
+    b_makes_lower_low = last_b["low"] < prev_low_b
+
+    if a_makes_higher_high and not b_makes_higher_high:
+        return "Bearish SMT"
+
+    if a_makes_lower_low and not b_makes_lower_low:
+        return "Bullish SMT"
+
     return "Yok"
 
 
-def detect_smt_placeholder(symbol: str) -> str:
-    _ = symbol
-    # Burayı sonra gerçek cross-market SMT ile büyütebiliriz
+def detect_smt_for_symbol(symbol: str, market_candles: Dict[str, List[Dict[str, Any]]]) -> str:
+    """
+    Öncelikli korelasyonlar:
+    EUR/USD <-> GBP/USD
+    EUR/USD <-> AUD/USD
+    GBP/USD <-> AUD/USD
+    """
+    if symbol not in market_candles:
+        return "Yok"
+
+    pairs_map = {
+        "EUR/USD": ["GBP/USD", "AUD/USD"],
+        "GBP/USD": ["EUR/USD", "AUD/USD"],
+        "AUD/USD": ["EUR/USD", "GBP/USD"],
+    }
+
+    peers = pairs_map.get(symbol, [])
+    if not peers:
+        return "Yok"
+
+    base_candles = market_candles.get(symbol)
+    if not base_candles:
+        return "Yok"
+
+    for peer in peers:
+        peer_candles = market_candles.get(peer)
+        if not peer_candles:
+            continue
+
+        smt = detect_smt_for_symbol(symbol, market_candles or {})
+        if smt != "Yok":
+            return smt
+
     return "Yok"
 
 
@@ -454,7 +532,11 @@ def build_trade_levels(candles: List[Dict[str, Any]], direction: str) -> Dict[st
     return {"entry": price, "sl": sl, "tp": tp}
 
 
-def analyze_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+def analyze_symbol(
+    symbol: str,
+    raw_data_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    market_candles: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> Optional[Dict[str, Any]]:
     raw = fetch_twelvedata_series(symbol)
     if not raw:
         return None
@@ -619,11 +701,27 @@ def scan_once() -> Dict[str, Any]:
         mark_scanner_heartbeat()
 
         results: Dict[str, Any] = {}
+raw_data_map: Dict[str, Dict[str, Any]] = {}
+        market_candles: Dict[str, List[Dict[str, Any]]] = {}
 
         for symbol in MARKETS:
             try:
-                result = analyze_symbol(symbol)
-
+                raw = fetch_twelvedata_series(symbol)
+                if raw:
+                    raw_data_map[symbol] = raw
+                    market_candles[symbol] = build_candles(raw)
+                else:
+                    print(f"{symbol} için raw data alınamadı.")
+            except Exception as e:
+                print(f"{symbol} preload hatası: {e}")
+        for symbol in MARKETS:
+            try:
+              
+ result = analyze_symbol(
+                    symbol,
+                    raw_data_map=raw_data_map,
+                    market_candles=market_candles,
+                )
                 if not result:
                     results[symbol] = {"ok": False, "error": "analysis_failed"}
                     print(f"{symbol} analiz üretilemedi.")
