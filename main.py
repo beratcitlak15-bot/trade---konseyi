@@ -20,17 +20,14 @@ PORT = int(os.getenv("PORT", "10000"))
 # =========================================================
 # SETTINGS
 # =========================================================
-SCAN_INTERVAL_SECONDS = 600   # 10 dakika
+SCAN_INTERVAL_SECONDS = 600  # 10 dakika
 TIMEFRAME = "15min"
 OUTPUTSIZE = 60
-
-# Minimum kalite eşiği
-MIN_SIGNAL_SCORE = 70
-
-# Telegram spam koruması
+MIN_SIGNAL_SCORE = 75  # sadece A / A+
 SIGNAL_COOLDOWN_MINUTES = 45
+SCANNER_HEARTBEAT_STALE_MINUTES = 20
+SCANNER_MONITOR_INTERVAL_SECONDS = 30
 
-# İzlenecek 5 parite
 MARKETS = [
     "EUR/USD",
     "GBP/USD",
@@ -39,22 +36,39 @@ MARKETS = [
     "AUD/USD",
 ]
 
+# =========================================================
+# GLOBAL STATE
+# =========================================================
 STATE: Dict[str, Any] = {
     "service_started_at": datetime.now(timezone.utc).isoformat(),
     "last_scan_at": None,
     "last_results": {},
     "active_signals": {},
     "scanner_started": False,
+    "scanner_last_heartbeat": None,
+    "scanner_restart_count": 0,
+    "last_error": None,
 }
 
 scan_lock = threading.Lock()
-scanner_started_once = False
+scanner_state_lock = threading.Lock()
+monitor_state_lock = threading.Lock()
+
+scanner_thread: Optional[threading.Thread] = None
+monitor_thread: Optional[threading.Thread] = None
+
+http = requests.Session()
+
 
 # =========================================================
-# UTILS
+# TIME / UTILS
 # =========================================================
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_utc().isoformat()
 
 
 def safe_float(value: Any) -> Optional[float]:
@@ -67,14 +81,19 @@ def safe_float(value: Any) -> Optional[float]:
 def minutes_since(iso_dt: Optional[str]) -> float:
     if not iso_dt:
         return 999999.0
+
     try:
-        then = datetime.fromisoformat(iso_dt)
-        if then.tzinfo is None:
-            then = then.replace(tzinfo=timezone.utc)
-        delta = datetime.now(timezone.utc) - then
+        dt = datetime.fromisoformat(iso_dt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = now_utc() - dt
         return delta.total_seconds() / 60.0
     except Exception:
         return 999999.0
+
+
+def mark_scanner_heartbeat() -> None:
+    STATE["scanner_last_heartbeat"] = now_utc_iso()
 
 
 def send_telegram_message(text: str) -> bool:
@@ -89,11 +108,14 @@ def send_telegram_message(text: str) -> bool:
     }
 
     try:
-        response = requests.post(url, json=payload, timeout=20)
+        response = http.post(url, json=payload, timeout=20)
         print(f"Telegram status: {response.status_code}")
+
         if response.status_code != 200:
             print(f"Telegram response: {response.text}")
-        return response.status_code == 200
+            return False
+
+        return True
     except Exception as e:
         print(f"Telegram gönderim hatası: {e}")
         return False
@@ -101,12 +123,11 @@ def send_telegram_message(text: str) -> bool:
 
 def get_killzone_label() -> str:
     """
-    Türkiye saati mantığına göre basit killzone etiketi.
-    İstersen sonra daha hassas saat blokları ekleriz.
+    Basit Türkiye saati bazlı killzone etiketi.
+    Killzone zorunlu DEĞİL, sadece puan artırır.
     """
     hour = datetime.now().hour
 
-    # Basit sınıflama
     if 10 <= hour <= 12:
         return "London Killzone"
     if 15 <= hour <= 17:
@@ -136,7 +157,7 @@ def fetch_twelvedata_series(symbol: str) -> Optional[Dict[str, Any]]:
     }
 
     try:
-        response = requests.get(url, params=params, timeout=25)
+        response = http.get(url, params=params, timeout=25)
         data = response.json()
 
         if response.status_code != 200:
@@ -174,15 +195,17 @@ def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         if None in (o, h, l, c):
             continue
 
-        candles.append({
-            "datetime": row.get("datetime"),
-            "open": o,
-            "high": h,
-            "low": l,
-            "close": c,
-        })
+        candles.append(
+            {
+                "datetime": row.get("datetime"),
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c,
+            }
+        )
 
-    # TwelveData çoğu zaman en yeni mumu üstte verir.
+    # TwelveData çoğu zaman en yeni mumu üstte verir
     candles.reverse()
     return candles
 
@@ -206,7 +229,7 @@ def detect_choch_like(candles: List[Dict[str, Any]]) -> str:
     if len(candles) < 4:
         return "Yok"
 
-    a, b, c, d = candles[-4], candles[-3], candles[-2], candles[-1]
+    _, b, _, d = candles[-4], candles[-3], candles[-2], candles[-1]
 
     if d["close"] > b["high"]:
         return "Bullish CHoCH"
@@ -284,7 +307,7 @@ def detect_fvg(candles: List[Dict[str, Any]]) -> str:
     if len(candles) < 3:
         return "Yok"
 
-    a, b, c = candles[-3], candles[-2], candles[-1]
+    a, _, c = candles[-3], candles[-2], candles[-1]
 
     if c["low"] > a["high"]:
         return "Bullish FVG"
@@ -303,6 +326,7 @@ def detect_true_order_block(candles: List[Dict[str, Any]], direction: str) -> st
         for c in reversed(lookback):
             if c["close"] < c["open"]:
                 return f"Bullish OB adayı ({c['low']:.5f} - {c['high']:.5f})"
+
     elif direction == "SHORT":
         for c in reversed(lookback):
             if c["close"] > c["open"]:
@@ -312,13 +336,13 @@ def detect_true_order_block(candles: List[Dict[str, Any]], direction: str) -> st
 
 
 def detect_smt_placeholder(symbol: str) -> str:
-    """
-    Şimdilik placeholder.
-    Sonra cross-market kıyas ile gerçek SMT kurabiliriz.
-    """
+    _ = symbol
     return "Yok"
 
 
+# =========================================================
+# CORE SIGNAL LOGIC
+# =========================================================
 def has_required_long_conditions(
     sweep: str,
     mss: str,
@@ -354,10 +378,9 @@ def score_signal(
     killzone_active: bool,
     true_order_block: str,
 ) -> Dict[str, Any]:
-    score = 0
+    score = 40  # zorunlular sağlandıysa taban puan
     quality = "Yok"
 
-    # Ara filtreler
     if direction == "LONG":
         if bias == "Yükseliş":
             score += 20
@@ -374,16 +397,13 @@ def score_signal(
         if premium_discount == "Premium":
             score += 15
 
-    # Opsiyoneller
+    # opsiyoneller
     if killzone_active:
         score += 10
     if smt != "Yok":
         score += 10
     if true_order_block != "Yok":
         score += 10
-
-    # Taban puan: zorunlular sağlandıysa başlangıç puanı
-    score += 40
 
     if score >= 90:
         quality = "A+"
@@ -451,10 +471,6 @@ def analyze_symbol(symbol: str) -> Optional[Dict[str, Any]]:
 
     direction = "YOK"
 
-    # =====================================================
-    # 3 KATMANLI MANTIK
-    # 1) ZORUNLULAR
-    # =====================================================
     if has_required_long_conditions(sweep, mss, choch, displacement):
         direction = "LONG"
     elif has_required_short_conditions(sweep, mss, choch, displacement):
@@ -524,7 +540,8 @@ def analyze_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         "short_score": short_score,
         "last_candle_time": candles[-1]["datetime"],
         "reason": "Zorunlu filtreler sağlandı",
-    } 
+    }
+
 
 def format_signal_message(result: Dict[str, Any]) -> str:
     entry = f"{result['entry']:.5f}" if result["entry"] is not None else "Yok"
@@ -592,6 +609,7 @@ def scan_once() -> Dict[str, Any]:
     with scan_lock:
         print("Tarama başladı...")
         STATE["last_scan_at"] = now_utc_iso()
+        mark_scanner_heartbeat()
 
         results: Dict[str, Any] = {}
 
@@ -632,39 +650,95 @@ def scan_once() -> Dict[str, Any]:
                 else:
                     print(f"{symbol} için sinyal yok.")
 
-            except Exception as e:
+                mark_scanner_heartbeat()
+
+except Exception as e:
                 results[symbol] = {"ok": False, "error": str(e)}
+                STATE["last_error"] = str(e)
                 print(f"{symbol} scan hatası: {e}")
 
         print("Tarama bitti.")
+        mark_scanner_heartbeat()
         return results
 
 
 def scanner_loop() -> None:
-    # Uygulama kalktıktan sonra kısa bekleme
     time.sleep(5)
 
     while True:
         try:
+            mark_scanner_heartbeat()
             scan_once()
         except Exception as e:
+            STATE["last_error"] = str(e)
             print(f"scanner_loop hata: {e}")
 
+        mark_scanner_heartbeat()
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 
+# =========================================================
+# SCANNER CONTROL (AUTO START + SELF HEAL)
+# =========================================================
 def start_background_scanner() -> None:
-    global scanner_started_once
+    global scanner_thread
 
-    if scanner_started_once:
+    with scanner_state_lock:
+        if scanner_thread and scanner_thread.is_alive():
+            STATE["scanner_started"] = True
+            return
+
+        scanner_thread = threading.Thread(target=scanner_loop, daemon=True)
+        scanner_thread.start()
+        STATE["scanner_started"] = True
+        STATE["scanner_restart_count"] += 1
+        mark_scanner_heartbeat()
+        print("Background scanner başlatıldı.")
+
+
+def ensure_scanner_running() -> None:
+    global scanner_thread
+
+    need_restart = False
+
+    with scanner_state_lock:
+        if scanner_thread is None or not scanner_thread.is_alive():
+            need_restart = True
+
+    if need_restart:
+        print("Scanner durmuş veya başlamamış. Yeniden başlatılıyor...")
+        start_background_scanner()
         return
 
-    scanner_started_once = True
-    STATE["scanner_started"] = True
+    heartbeat_age = minutes_since(STATE.get("scanner_last_heartbeat"))
+    if heartbeat_age > SCANNER_HEARTBEAT_STALE_MINUTES:
+        print("Scanner heartbeat çok eski. Yeniden başlatılıyor...")
+        start_background_scanner()
 
-    t = threading.Thread(target=scanner_loop, daemon=True)
-    t.start()
-    print("Background scanner başlatıldı.")
+
+def monitor_loop() -> None:
+    time.sleep(3)
+
+    while True:
+        try:
+            ensure_scanner_running()
+        except Exception as e:
+            STATE["last_error"] = str(e)
+            print(f"monitor_loop hata: {e}")
+
+        time.sleep(SCANNER_MONITOR_INTERVAL_SECONDS)
+
+
+def start_monitor_once() -> None:
+    global monitor_thread
+
+    with monitor_state_lock:
+        if monitor_thread and monitor_thread.is_alive():
+            return
+
+        monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+        monitor_thread.start()
+        print("Scanner monitor başlatıldı.")
 
 
 # =========================================================
@@ -672,60 +746,82 @@ def start_background_scanner() -> None:
 # =========================================================
 @app.route("/")
 def home():
-    return jsonify({
-        "ok": True,
-        "service": "trade-konseyi",
-        "message": "Service is running",
-        "scanner_started": STATE.get("scanner_started"),
-        "last_scan_at": STATE.get("last_scan_at"),
-        "markets": MARKETS,
-    })
+    ensure_scanner_running()
+    return jsonify(
+        {
+            "ok": True,
+            "service": "trade-konseyi",
+            "message": "Service is running",
+            "scanner_started": STATE.get("scanner_started"),
+            "scanner_restart_count": STATE.get("scanner_restart_count"),
+            "scanner_last_heartbeat": STATE.get("scanner_last_heartbeat"),
+            "last_scan_at": STATE.get("last_scan_at"),
+            "markets": MARKETS,
+        }
+    )
 
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "scanner_started": STATE.get("scanner_started"),
-        "last_scan_at": STATE.get("last_scan_at"),
-        "watched_markets": len(MARKETS),
-        "env": {
-            "TWELVEDATA_API_KEY": bool(TWELVEDATA_API_KEY),
-            "TELEGRAM_BOT_TOKEN": bool(TELEGRAM_BOT_TOKEN),
-            "TELEGRAM_CHAT_ID": bool(TELEGRAM_CHAT_ID),
+    ensure_scanner_running()
+    return jsonify(
+        {
+            "ok": True,
+            "scanner_started": STATE.get("scanner_started"),
+            "scanner_restart_count": STATE.get("scanner_restart_count"),
+            "scanner_last_heartbeat": STATE.get("scanner_last_heartbeat"),
+            "last_scan_at": STATE.get("last_scan_at"),
+            "watched_markets": len(MARKETS),
+            "last_error": STATE.get("last_error"),
+            "env": {
+                "TWELVEDATA_API_KEY": bool(TWELVEDATA_API_KEY),
+                "TELEGRAM_BOT_TOKEN": bool(TELEGRAM_BOT_TOKEN),
+                "TELEGRAM_CHAT_ID": bool(TELEGRAM_CHAT_ID),
+            },
         }
-    })
+    )
 
 
 @app.route("/analyze/<path:symbol>")
 def analyze_route(symbol: str):
+    ensure_scanner_running()
     symbol = symbol.strip()
     result = analyze_symbol(symbol)
 
     if not result:
-        return jsonify({
-            "ok": False,
-            "error": "analysis_failed",
-            "symbol": symbol,
-        }), 400
+        return jsonify(
+            {
+                "ok": False,
+                "error": "analysis_failed",
+                "symbol": symbol,
+            }
+        ), 400
 
-    return jsonify({
-        "ok": True,
-        "result": result,
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "result": result,
+        }
+    )
 
 
 @app.route("/status")
 def status():
-    return jsonify({
-        "ok": True,
-        "service_started_at": STATE.get("service_started_at"),
-        "scanner_started": STATE.get("scanner_started"),
-        "last_scan_at": STATE.get("last_scan_at"),
-        "markets": MARKETS,
-        "last_results": STATE.get("last_results", {}),
-        "active_signals": STATE.get("active_signals", {}),
-    })
+    ensure_scanner_running()
+    return jsonify(
+        {
+            "ok": True,
+            "service_started_at": STATE.get("service_started_at"),
+            "scanner_started": STATE.get("scanner_started"),
+            "scanner_restart_count": STATE.get("scanner_restart_count"),
+            "scanner_last_heartbeat": STATE.get("scanner_last_heartbeat"),
+            "last_scan_at": STATE.get("last_scan_at"),
+            "last_error": STATE.get("last_error"),
+            "markets": MARKETS,
+            "last_results": STATE.get("last_results", {}),
+            "active_signals": STATE.get("active_signals", {}),
+        }
+    )
 
 
 # =========================================================
@@ -735,7 +831,8 @@ print(f"TWELVEDATA_API_KEY dolu mu: {'evet' if bool(TWELVEDATA_API_KEY) else 'ha
 print(f"TELEGRAM_BOT_TOKEN dolu mu: {'evet' if bool(TELEGRAM_BOT_TOKEN) else 'hayır'}")
 print(f"TELEGRAM_CHAT_ID dolu mu: {'evet' if bool(TELEGRAM_CHAT_ID) else 'hayır'}")
 
-start_background_scanner()
+start_monitor_once()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
