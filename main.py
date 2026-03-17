@@ -20,18 +20,17 @@ PORT = int(os.getenv("PORT", "10000"))
 # =========================================================
 # SETTINGS
 # =========================================================
-SCAN_INTERVAL_SECONDS = 60
+SCAN_INTERVAL_SECONDS = 120
 TIMEFRAME = "15min"
-OUTPUTSIZE = 120
-MIN_SIGNAL_SCORE = 75
+OUTPUTSIZE = 60
 
+# İzlenecek pariteler
 MARKETS = [
     "EUR/USD",
     "GBP/USD",
     "XAU/USD",
     "USD/JPY",
     "AUD/USD",
-    "DX",
 ]
 
 STATE: Dict[str, Any] = {
