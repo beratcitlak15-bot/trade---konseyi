@@ -539,22 +539,22 @@ def analyze_symbol(
 ) -> Optional[Dict[str, Any]]:
     raw = None
 
-if raw_data_map and symbol in raw_data_map:
-    raw = raw_data_map[symbol]
-else:
-    raw = fetch_twelvedata_series(symbol)
+    if raw_data_map and symbol in raw_data_map:
+        raw = raw_data_map[symbol]
+    else:
+        raw = fetch_twelvedata_series(symbol)
 
-if not raw:
-    return None
+    if not raw:
+        return None
 
-if market_candles and symbol in market_candles:
-    candles = market_candles[symbol]
-else:
-    candles = build_candles(raw)
+    if market_candles and symbol in market_candles:
+        candles = market_candles[symbol]
+    else:
+        candles = build_candles(raw)
 
-if len(candles) < 20:
-    print(f"{symbol}  için yeterli mum yok.")
-    return None
+    if len(candles) < 20:
+        print(f"{symbol} için yeterli mum yok.")
+        return None
 
     last_price = candles[-1]["close"]
 
