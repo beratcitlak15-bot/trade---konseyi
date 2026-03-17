@@ -20,7 +20,7 @@ PORT = int(os.getenv("PORT", "10000"))
 # =========================================================
 # SETTINGS
 # =========================================================
-SCAN_INTERVAL_SECONDS = 120
+SCAN_INTERVAL_SECONDS = 600
 TIMEFRAME = "15min"
 OUTPUTSIZE = 60
 MIN_SIGNAL_SCORE = 75
