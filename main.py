@@ -798,15 +798,10 @@ def watchdog_loop() -> None:
     while True:
         try:
             last_scan = STATE.get("last_scan_at")
-            stale = minutes_since(last_scan) * 60 >= WATCHDOG_STALE_AFTER_SECONDS
-            scanner_alive = scanner_thread is not None and scanner_thread.is_alive()
+            minutes_passed = minutes_since(last_scan)
 
-            if stale or not scanner_alive:
-                print(
-                    f"Watchdog uyarısı -> stale={stale}, "
-                    f"scanner_alive={scanner_alive}, "
-                    f"last_scan_at={last_scan}"
-                )
+            if minutes_passed > 12:
+                print(f"Watchdog restart -> {minutes_passed:.2f} dk tarama yok")
                 start_background_scanner()
 
         except Exception as e:
