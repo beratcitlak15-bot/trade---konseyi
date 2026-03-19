@@ -492,6 +492,37 @@ def detect_liquidity_sweep_advanced(candles: List[Dict[str, Any]]) -> Dict[str, 
 
     return {"label": "Yok", "source": "Yok"}
 
+# =========================================================
+# PREMIUM / DISCOUNT (ADVANCED)
+# =========================================================
+def detect_premium_discount_advanced(candles: List[Dict[str, Any]]) -> str:
+    if len(candles) < 30:
+        return "Nötr"
+
+    swings = collect_swings(candles)
+    highs = swings["highs"]
+    lows = swings["lows"]
+
+    if len(highs) < 2 or len(lows) < 2:
+        return "Nötr"
+
+    recent_highs = highs[-4:] if len(highs) >= 4 else highs
+    recent_lows = lows[-4:] if len(lows) >= 4 else lows
+
+    dealing_high = max(x["price"] for x in recent_highs)
+    dealing_low = min(x["price"] for x in recent_lows)
+
+    if dealing_high <= dealing_low:
+        return "Nötr"
+
+    equilibrium = (dealing_high + dealing_low) / 2
+    price = candles[-1]["close"]
+
+    if price > equilibrium:
+        return "Premium"
+    if price < equilibrium:
+        return "Discount"
+    return "Nötr"
 
 # =========================================================
 # FVG (SMART)
