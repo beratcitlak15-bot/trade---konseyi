@@ -890,19 +890,20 @@ def run_scan():
             market_candles[symbol] = build_candles(raw)
 
     for symbol in MARKETS:
-        result = analyze_symbol(symbol, raw_data_map, market_candles)
+    result = analyze_symbol(symbol, raw_data_map, market_candles)
 
-        if not result:
-            continue
+    if not result:
+        print(f"{symbol} -> setup yok")
+        continue
 
-        if result["score"] >= MIN_SIGNAL_SCORE and result["quality"] in ("A", "A+"):
-            msg = format_signal_message(result)
-            send_telegram_message(msg)
-            print(f"{symbol} SIGNAL")
+    print(
+        f"{symbol} -> yön: {result['direction']}, "
+        f"skor: {result['score']}, kalite: {result['quality']}"
+    )
 
-    print("SCAN END")
-    print("=" * 50)
-
-
-if __name__ == "__main__":
-    run_scan()
+    if result["score"] >= MIN_SIGNAL_SCORE and result["quality"] in ("A", "A+"):
+        msg = format_signal_message(result)
+        send_telegram_message(msg)
+        print(f"{symbol} -> 🚀 SIGNAL GÖNDERİLDİ")
+    else:
+        print(f"{symbol} -> setup var ama filtreyi geçemedi")
