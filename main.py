@@ -876,7 +876,6 @@ def format_signal_message(r):
 # MAIN RUN
 # =========================================================
 def run_scan():
-
     print("=" * 50)
     print("ELITE SCAN START")
 
@@ -888,22 +887,31 @@ def run_scan():
         if raw:
             raw_data_map[symbol] = raw
             market_candles[symbol] = build_candles(raw)
+        else:
+            print(f"{symbol} -> veri alınamadı")
 
     for symbol in MARKETS:
-    result = analyze_symbol(symbol, raw_data_map, market_candles)
+        result = analyze_symbol(symbol, raw_data_map, market_candles)
 
-    if not result:
-        print(f"{symbol} -> setup yok")
-        continue
+        if not result:
+            print(f"{symbol} -> setup yok")
+            continue
 
-    print(
-        f"{symbol} -> yön: {result['direction']}, "
-        f"skor: {result['score']}, kalite: {result['quality']}"
-    )
+        print(
+            f"{symbol} -> yön: {result['direction']}, "
+            f"skor: {result['score']}, kalite: {result['quality']}"
+        )
 
-    if result["score"] >= MIN_SIGNAL_SCORE and result["quality"] in ("A", "A+"):
-        msg = format_signal_message(result)
-        send_telegram_message(msg)
-        print(f"{symbol} -> 🚀 SIGNAL GÖNDERİLDİ")
-    else:
-        print(f"{symbol} -> setup var ama filtreyi geçemedi")
+        if result["score"] >= MIN_SIGNAL_SCORE and result["quality"] in ("A", "A+"):
+            msg = format_signal_message(result)
+            send_telegram_message(msg)
+            print(f"{symbol} -> SIGNAL GÖNDERİLDİ")
+        else:
+            print(f"{symbol} -> setup var ama filtreyi geçemedi")
+
+    print("SCAN END")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    run_scan()
