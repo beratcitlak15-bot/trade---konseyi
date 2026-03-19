@@ -1,6 +1,6 @@
 import os
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from datetime import datetime, UTC
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -15,8 +15,12 @@ TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 # SETTINGS
 # =========================================================
 TIMEFRAME = "15min"
-OUTPUTSIZE = 60
-MIN_SIGNAL_SCORE = 75  # sadece A ve A+
+OUTPUTSIZE = 180
+
+# ELITE mod:
+# A ve A+ sinyal gönderir ama sniper kadar aşırı katı değildir
+MIN_SIGNAL_SCORE = 80
+
 MARKETS = [
     "EUR/USD",
     "GBP/USD",
@@ -26,7 +30,6 @@ MARKETS = [
 ]
 
 http = requests.Session()
-
 
 # =========================================================
 # UTILS
@@ -39,7 +42,20 @@ def safe_float(value: Any) -> Optional[float]:
 
 
 def now_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def parse_candle_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=UTC)
+        except Exception:
+            pass
+
+    return None
 
 
 def send_telegram_message(text: str) -> bool:
@@ -65,18 +81,19 @@ def send_telegram_message(text: str) -> bool:
         return False
 
 
-def get_killzone_label() -> str:
-    hour = datetime.now().hour
+def get_killzone_label(now_utc: Optional[datetime] = None) -> str:
+    dt = now_utc or datetime.now(UTC)
+    hour = dt.hour
 
-    if 10 <= hour <= 12:
+    if 7 <= hour < 10:
         return "London Killzone"
-    if 15 <= hour <= 17:
+    if 12 <= hour < 15:
         return "New York Killzone"
     return "Killzone Dışı"
 
 
-def is_killzone_active() -> bool:
-    return get_killzone_label() != "Killzone Dışı"
+def is_killzone_active(now_utc: Optional[datetime] = None) -> bool:
+    return get_killzone_label(now_utc) != "Killzone Dışı"
 
 
 # =========================================================
@@ -120,7 +137,7 @@ def fetch_twelvedata_series(symbol: str) -> Optional[Dict[str, Any]]:
 
 
 # =========================================================
-# ANALYSIS HELPERS
+# CANDLES
 # =========================================================
 def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
     values = raw.get("values", [])
@@ -131,6 +148,7 @@ def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         h = safe_float(row.get("high"))
         l = safe_float(row.get("low"))
         c = safe_float(row.get("close"))
+        dt = parse_candle_dt(row.get("datetime"))
 
         if None in (o, h, l, c):
             continue
@@ -138,6 +156,7 @@ def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         candles.append(
             {
                 "datetime": row.get("datetime"),
+                "dt": dt,
                 "open": o,
                 "high": h,
                 "low": l,
@@ -149,197 +168,435 @@ def build_candles(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
     return candles
 
 
-def detect_bias(candles: List[Dict[str, Any]]) -> str:
-    if len(candles) < 20:
-        return "Nötr"
-
-    closes = [c["close"] for c in candles[-20:]]
-    sma_5 = sum(closes[-5:]) / 5
-    sma_20 = sum(closes) / 20
-
-    if sma_5 > sma_20:
-        return "Yükseliş"
-    if sma_5 < sma_20:
-        return "Düşüş"
-    return "Nötr"
+def candle_body(c: Dict[str, Any]) -> float:
+    return abs(c["close"] - c["open"])
 
 
-def detect_choch_like(candles: List[Dict[str, Any]]) -> str:
-    if len(candles) < 4:
-        return "Yok"
-
-    _, b, _, d = candles[-4], candles[-3], candles[-2], candles[-1]
-
-    if d["close"] > b["high"]:
-        return "Bullish CHoCH"
-    if d["close"] < b["low"]:
-        return "Bearish CHoCH"
-    return "Yok"
+def candle_range(c: Dict[str, Any]) -> float:
+    return c["high"] - c["low"]
 
 
-def detect_mss_like(candles: List[Dict[str, Any]]) -> str:
-    if len(candles) < 6:
-        return "Yok"
-
-    recent_high = max(x["high"] for x in candles[-6:-1])
-    recent_low = min(x["low"] for x in candles[-6:-1])
-    last_close = candles[-1]["close"]
-
-    if last_close > recent_high:
-        return "Bullish MSS"
-    if last_close < recent_low:
-        return "Bearish MSS"
-    return "Yok"
+def average_body(candles: List[Dict[str, Any]], count: int = 10) -> float:
+    sample = candles[-count:] if len(candles) >= count else candles
+    if not sample:
+        return 0.0
+    return sum(candle_body(x) for x in sample) / len(sample)
 
 
-def detect_liquidity_sweep(candles: List[Dict[str, Any]]) -> str:
-    if len(candles) < 6:
-        return "Yok"
-
-    prev_high = max(x["high"] for x in candles[-6:-1])
-    prev_low = min(x["low"] for x in candles[-6:-1])
-    last = candles[-1]
-
-    if last["high"] > prev_high and last["close"] < prev_high:
-        return "Üst likidite sweep"
-    if last["low"] < prev_low and last["close"] > prev_low:
-        return "Alt likidite sweep"
-    return "Yok"
+def average_range(candles: List[Dict[str, Any]], count: int = 10) -> float:
+    sample = candles[-count:] if len(candles) >= count else candles
+    if not sample:
+        return 0.0
+    return sum(candle_range(x) for x in sample) / len(sample)
 
 
+# =========================================================
+# SWING / PIVOT ENGINE
+# =========================================================
+def is_pivot_high(
+    candles: List[Dict[str, Any]],
+    i: int,
+    left: int = 2,
+    right: int = 2,
+) -> bool:
+    if i - left < 0 or i + right >= len(candles):
+        return False
+
+    current = candles[i]["high"]
+
+    for j in range(i - left, i + right + 1):
+        if j == i:
+            continue
+        if candles[j]["high"] >= current:
+            return False
+
+    return True
+
+
+def is_pivot_low(
+    candles: List[Dict[str, Any]],
+    i: int,
+    left: int = 2,
+    right: int = 2,
+) -> bool:
+    if i - left < 0 or i + right >= len(candles):
+        return False
+
+    current = candles[i]["low"]
+
+    for j in range(i - left, i + right + 1):
+        if j == i:
+            continue
+        if candles[j]["low"] <= current:
+            return False
+
+    return True
+
+
+def collect_swings(
+    candles: List[Dict[str, Any]],
+    left: int = 2,
+    right: int = 2,
+) -> Dict[str, List[Dict[str, Any]]]:
+    highs: List[Dict[str, Any]] = []
+    lows: List[Dict[str, Any]] = []
+
+    for i in range(len(candles)):
+        if is_pivot_high(candles, i, left=left, right=right):
+            highs.append(
+                {
+                    "index": i,
+                    "price": candles[i]["high"],
+                    "datetime": candles[i]["datetime"],
+                }
+            )
+
+        if is_pivot_low(candles, i, left=left, right=right):
+            lows.append(
+                {
+                    "index": i,
+                    "price": candles[i]["low"],
+                    "datetime": candles[i]["datetime"],
+                }
+            )
+
+    return {"highs": highs, "lows": lows}
+
+
+def last_two(items: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    if len(items) >= 2:
+        return items[-2], items[-1]
+    if len(items) == 1:
+        return None, items[-1]
+    return None, None
+
+
+# =========================================================
+# SESSION / LIQUIDITY CONTEXT
+# =========================================================
+def get_session_name(dt: Optional[datetime]) -> str:
+    if not dt:
+        return "Unknown"
+
+    hour = dt.hour
+    if 0 <= hour < 6:
+        return "Asia"
+    if 6 <= hour < 12:
+        return "London"
+    if 12 <= hour < 17:
+        return "New York"
+    return "Off Session"
+
+
+def get_recent_session_box(candles: List[Dict[str, Any]], session_name: str) -> Optional[Dict[str, Any]]:
+    session_candles = [c for c in candles if get_session_name(c.get("dt")) == session_name]
+    if len(session_candles) < 3:
+        return None
+
+    recent = session_candles[-24:] if len(session_candles) > 24 else session_candles
+    return {
+        "high": max(x["high"] for x in recent),
+        "low": min(x["low"] for x in recent),
+        "start": recent[0]["datetime"],
+        "end": recent[-1]["datetime"],
+    }
+
+
+def get_previous_day_levels(candles: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    day_groups: Dict[str, List[Dict[str, Any]]] = {}
+
+    for c in candles:
+        dt = c.get("dt")
+        if not dt:
+            continue
+        key = dt.strftime("%Y-%m-%d")
+        day_groups.setdefault(key, []).append(c)
+
+    all_days = sorted(day_groups.keys())
+    if len(all_days) < 2:
+        return {"pdh": None, "pdl": None}
+
+    prev_day = day_groups[all_days[-2]]
+
+    return {
+        "pdh": max(x["high"] for x in prev_day),
+        "pdl": min(x["low"] for x in prev_day),
+    }
+
+
+def approx_equal(a: float, b: float, tolerance_ratio: float = 0.0008) -> bool:
+    if a == 0 or b == 0:
+        return False
+    return abs(a - b) / max(abs(a), abs(b)) <= tolerance_ratio
+
+
+def equal_highs_exists(candles: List[Dict[str, Any]], tolerance_ratio: float = 0.0008) -> Optional[float]:
+    swings = collect_swings(candles, left=2, right=2)["highs"]
+    if len(swings) < 2:
+        return None
+
+    recent = swings[-6:]
+    for i in range(len(recent)):
+        for j in range(i + 1, len(recent)):
+            a = recent[i]["price"]
+            b = recent[j]["price"]
+            if approx_equal(a, b, tolerance_ratio):
+                return max(a, b)
+
+    return None
+
+
+def equal_lows_exists(candles: List[Dict[str, Any]], tolerance_ratio: float = 0.0008) -> Optional[float]:
+    swings = collect_swings(candles, left=2, right=2)["lows"]
+    if len(swings) < 2:
+        return None
+
+    recent = swings[-6:]
+    for i in range(len(recent)):
+        for j in range(i + 1, len(recent)):
+            a = recent[i]["price"]
+            b = recent[j]["price"]
+            if approx_equal(a, b, tolerance_ratio):
+                return min(a, b)
+
+    return None
+
+# =========================================================
+# DISPLACEMENT
+# =========================================================
 def detect_displacement(candles: List[Dict[str, Any]]) -> str:
-    if len(candles) < 10:
+    if len(candles) < 12:
         return "Zayıf"
 
-    bodies = [abs(c["close"] - c["open"]) for c in candles[-10:-1]]
-    avg_body = sum(bodies) / len(bodies) if bodies else 0
-    last_body = abs(candles[-1]["close"] - candles[-1]["open"])
+    last = candles[-1]
+    avg_b = average_body(candles[-11:-1], 10)
+    avg_r = average_range(candles[-11:-1], 10)
 
-    if avg_body == 0:
+    if avg_b == 0 or avg_r == 0:
         return "Zayıf"
 
-    if last_body >= avg_body * 1.8:
+    body = candle_body(last)
+    rng = candle_range(last)
+
+    if rng == 0:
+        return "Zayıf"
+
+    strong = body >= avg_b * 1.8 and rng >= avg_r * 1.4
+    medium = body >= avg_b * 1.2 and rng >= avg_r * 1.1
+
+    if strong:
         return "Güçlü"
-    if last_body >= avg_body * 1.2:
+    if medium:
         return "Orta"
     return "Zayıf"
 
 
-def detect_premium_discount(candles: List[Dict[str, Any]]) -> str:
-    if len(candles) < 20:
+# =========================================================
+# HTF BIAS (PRO)
+# =========================================================
+def detect_htf_bias_advanced(candles: List[Dict[str, Any]]) -> str:
+    if len(candles) < 40:
         return "Nötr"
 
-    recent = candles[-20:]
-    high_ = max(x["high"] for x in recent)
-    low_ = min(x["low"] for x in recent)
-    mid = (high_ + low_) / 2
-    last_close = candles[-1]["close"]
+    swings = collect_swings(candles)
+    prev_high, last_high = last_two(swings["highs"])
+    prev_low, last_low = last_two(swings["lows"])
 
-    if last_close > mid:
-        return "Premium"
-    if last_close < mid:
-        return "Discount"
+    if not prev_high or not last_high or not prev_low or not last_low:
+        return "Nötr"
+
+    if last_high["price"] > prev_high["price"] and last_low["price"] > prev_low["price"]:
+        return "Yükseliş"
+
+    if last_high["price"] < prev_high["price"] and last_low["price"] < prev_low["price"]:
+        return "Düşüş"
+
     return "Nötr"
 
 
-def detect_fvg(candles: List[Dict[str, Any]]) -> str:
-    if len(candles) < 3:
-        return "Yok"
+# =========================================================
+# MSS / CHOCH (GERÇEK STRUCTURE)
+# =========================================================
+def detect_mss_choch_advanced(
+    candles: List[Dict[str, Any]],
+    htf_bias: str,
+) -> Dict[str, str]:
 
-    a, _, c = candles[-3], candles[-2], candles[-1]
+    if len(candles) < 25:
+        return {"mss": "Yok", "choch": "Yok"}
 
-    if c["low"] > a["high"]:
-        return "Bullish FVG"
-    if c["high"] < a["low"]:
-        return "Bearish FVG"
-    return "Yok"
+    swings = collect_swings(candles)
+    highs = swings["highs"]
+    lows = swings["lows"]
 
+    if len(highs) < 2 or len(lows) < 2:
+        return {"mss": "Yok", "choch": "Yok"}
 
-def detect_true_order_block(candles: List[Dict[str, Any]], direction: str) -> str:
-    if len(candles) < 8:
-        return "Yok"
+    prev_high, last_high = last_two(highs)
+    prev_low, last_low = last_two(lows)
 
-    lookback = candles[-8:-1]
+    last_close = candles[-1]["close"]
 
-    if direction == "LONG":
-        for c in reversed(lookback):
-            if c["close"] < c["open"]:
-                return f"Bullish OB adayı ({c['low']:.5f} - {c['high']:.5f})"
+    mss = "Yok"
+    choch = "Yok"
 
-    elif direction == "SHORT":
-        for c in reversed(lookback):
-            if c["close"] > c["open"]:
-                return f"Bearish OB adayı ({c['low']:.5f} - {c['high']:.5f})"
+    if last_close > last_high["price"]:
+        if htf_bias == "Düşüş":
+            choch = "Bullish CHoCH"
+        else:
+            mss = "Bullish MSS"
 
-    return "Yok"
+    elif last_close < last_low["price"]:
+        if htf_bias == "Yükseliş":
+            choch = "Bearish CHoCH"
+        else:
+            mss = "Bearish MSS"
+
+    return {"mss": mss, "choch": choch}
 
 
 # =========================================================
-# SMT
+# LIQUIDITY SWEEP (PRO)
 # =========================================================
-def smt_compare_pair(
-    candles_a: List[Dict[str, Any]],
-    candles_b: List[Dict[str, Any]],
-) -> str:
-    if len(candles_a) < 6 or len(candles_b) < 6:
-        return "Yok"
+def detect_liquidity_sweep_advanced(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(candles) < 30:
+        return {"label": "Yok", "source": "Yok"}
 
-    a_prev_high = max(x["high"] for x in candles_a[-6:-1])
-    a_prev_low = min(x["low"] for x in candles_a[-6:-1])
-    b_prev_high = max(x["high"] for x in candles_b[-6:-1])
-    b_prev_low = min(x["low"] for x in candles_b[-6:-1])
+    last = candles[-1]
 
-    a_last = candles_a[-1]
-    b_last = candles_b[-1]
+    prev_day = get_previous_day_levels(candles)
+    asia = get_recent_session_box(candles[-80:], "Asia")
 
-    a_makes_higher_high = a_last["high"] > a_prev_high
-    b_makes_higher_high = b_last["high"] > b_prev_high
+    eqh = equal_highs_exists(candles)
+    eql = equal_lows_exists(candles)
 
-    a_makes_lower_low = a_last["low"] < a_prev_low
-    b_makes_lower_low = b_last["low"] < b_prev_low
+    # ÜST sweep
+    if prev_day["pdh"] and last["high"] > prev_day["pdh"] and last["close"] < prev_day["pdh"]:
+        return {"label": "Üst likidite sweep", "source": "PDH"}
 
-    if a_makes_higher_high and not b_makes_higher_high:
-        return "Bearish SMT"
+    if asia and last["high"] > asia["high"] and last["close"] < asia["high"]:
+        return {"label": "Üst likidite sweep", "source": "Asia High"}
 
-    if a_makes_lower_low and not b_makes_lower_low:
-        return "Bullish SMT"
+    if eqh and last["high"] > eqh and last["close"] < eqh:
+        return {"label": "Üst likidite sweep", "source": "EQH"}
 
-    return "Yok"
+    # ALT sweep
+    if prev_day["pdl"] and last["low"] < prev_day["pdl"] and last["close"] > prev_day["pdl"]:
+        return {"label": "Alt likidite sweep", "source": "PDL"}
+
+    if asia and last["low"] < asia["low"] and last["close"] > asia["low"]:
+        return {"label": "Alt likidite sweep", "source": "Asia Low"}
+
+    if eql and last["low"] < eql and last["close"] > eql:
+        return {"label": "Alt likidite sweep", "source": "EQL"}
+
+    return {"label": "Yok", "source": "Yok"}
 
 
-def detect_smt_for_symbol(
+# =========================================================
+# FVG (SMART)
+# =========================================================
+def detect_fvg_advanced(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(candles) < 6:
+        return {"label": "Yok", "zone": None}
+
+    for i in range(len(candles) - 3, len(candles) - 8, -1):
+        a = candles[i - 1]
+        c = candles[i + 1]
+
+        if c["low"] > a["high"]:
+            return {
+                "label": "Bullish FVG",
+                "zone": (a["high"], c["low"]),
+            }
+
+        if c["high"] < a["low"]:
+            return {
+                "label": "Bearish FVG",
+                "zone": (c["high"], a["low"]),
+            }
+
+    return {"label": "Yok", "zone": None}
+
+
+# =========================================================
+# ORDER BLOCK (ELITE)
+# =========================================================
+def detect_true_order_block_advanced(
+    candles: List[Dict[str, Any]],
+    direction: str,
+) -> Dict[str, Any]:
+
+    if len(candles) < 12:
+        return {"label": "Yok", "zone": None}
+
+    for i in range(len(candles) - 2, len(candles) - 10, -1):
+        c = candles[i]
+
+        if direction == "LONG" and c["close"] < c["open"]:
+            return {
+                "label": "Bullish OB",
+                "zone": (c["low"], c["high"]),
+            }
+
+        if direction == "SHORT" and c["close"] > c["open"]:
+            return {
+                "label": "Bearish OB",
+                "zone": (c["low"], c["high"]),
+            }
+
+    return {"label": "Yok", "zone": None}
+
+
+# =========================================================
+# SMT (ELITE - OPSİYONEL)
+# =========================================================
+def detect_smt_for_symbol_advanced(
     symbol: str,
     market_candles: Dict[str, List[Dict[str, Any]]],
-) -> str:
-    if symbol not in market_candles:
-        return "Yok"
+) -> Dict[str, str]:
 
-    pairs_map = {
+    pairs = {
         "EUR/USD": ["GBP/USD", "AUD/USD"],
         "GBP/USD": ["EUR/USD", "AUD/USD"],
         "AUD/USD": ["EUR/USD", "GBP/USD"],
     }
 
-    compare_list = pairs_map.get(symbol, [])
-    if not compare_list:
-        return "Yok"
+    if symbol not in pairs:
+        return {"smt": "Yok", "strength": "Zayıf"}
 
-    symbol_candles = market_candles[symbol]
+    base = market_candles.get(symbol)
+    if not base or len(base) < 20:
+        return {"smt": "Yok", "strength": "Zayıf"}
 
-    for other_symbol in compare_list:
-        other_candles = market_candles.get(other_symbol)
-        if not other_candles:
+    for other_symbol in pairs[symbol]:
+        other = market_candles.get(other_symbol)
+        if not other or len(other) < 20:
             continue
 
-        smt = smt_compare_pair(symbol_candles, other_candles)
-        if smt != "Yok":
-            return smt
+        base_high = base[-1]["high"]
+        other_high = other[-1]["high"]
 
-    return "Yok"
+        base_prev = base[-2]["high"]
+        other_prev = other[-2]["high"]
+
+        if base_high > base_prev and other_high <= other_prev:
+            return {"smt": "Bearish SMT", "strength": "Orta"}
+
+        base_low = base[-1]["low"]
+        other_low = other[-1]["low"]
+
+        base_prev_low = base[-2]["low"]
+        other_prev_low = other[-2]["low"]
+
+        if base_low < base_prev_low and other_low >= other_prev_low:
+            return {"smt": "Bullish SMT", "strength": "Orta"}
+
+    return {"smt": "Yok", "strength": "Zayıf"}
 
 
 # =========================================================
-# CORE SIGNAL LOGIC
+# ELITE TRADE FILTERS
 # =========================================================
 def has_required_long_conditions(
     sweep: str,
@@ -367,276 +624,254 @@ def has_required_short_conditions(
     )
 
 
-def score_signal(
+# =========================================================
+# NO-CHASE (ELITE VERSION - YUMUŞAK)
+# =========================================================
+def is_no_chase(
+    candles: List[Dict[str, Any]],
+    entry: float,
     direction: str,
-    bias: str,
+) -> bool:
+    if len(candles) < 5:
+        return False
+
+    last = candles[-1]["close"]
+    avg = average_range(candles[-10:], 10)
+
+    if avg == 0:
+        return False
+
+    # sadece aşırı kaçmışsa iptal
+    if direction == "LONG":
+        if last > entry + avg * 1.5:
+            return True
+
+    if direction == "SHORT":
+        if last < entry - avg * 1.5:
+            return True
+
+    return False
+
+
+# =========================================================
+# ELITE SCORING
+# =========================================================
+def score_signal_advanced(
+    direction: str,
+    htf_bias: str,
     fvg: str,
     premium_discount: str,
     smt: str,
     killzone_active: bool,
-    true_order_block: str,
+    sweep_source: str,
+    displacement: str,
 ) -> Dict[str, Any]:
+
     score = 40
-    quality = "Yok"
 
-    if direction == "LONG":
-        if bias == "Yükseliş":
-            score += 20
-        if fvg == "Bullish FVG":
-            score += 15
-        if premium_discount == "Discount":
-            score += 15
-        if smt == "Bullish SMT":
-            score += 10
+    # HTF uyum
+    if direction == "LONG" and htf_bias == "Yükseliş":
+        score += 15
+    if direction == "SHORT" and htf_bias == "Düşüş":
+        score += 15
 
-    elif direction == "SHORT":
-        if bias == "Düşüş":
-            score += 20
-        if fvg == "Bearish FVG":
-            score += 15
-        if premium_discount == "Premium":
-            score += 15
-        if smt == "Bearish SMT":
-            score += 10
+    # SMT bonus (zorunlu değil)
+    if smt == "Bullish SMT" or smt == "Bearish SMT":
+        score += 10
 
+    # FVG
+    if "FVG" in fvg:
+        score += 10
+
+    # PD
+    if direction == "LONG" and premium_discount == "Discount":
+        score += 10
+    if direction == "SHORT" and premium_discount == "Premium":
+        score += 10
+
+    # Sweep kalitesi
+    if sweep_source in ("PDH", "PDL", "Asia High", "Asia Low", "EQH", "EQL"):
+        score += 5
+
+    # Displacement
+    if displacement == "Güçlü":
+        score += 10
+
+    # Killzone
     if killzone_active:
-        score += 10
-
-    if true_order_block != "Yok":
-        score += 10
+        score += 5
 
     if score >= 90:
         quality = "A+"
-    elif score >= 75:
+    elif score >= 80:
         quality = "A"
-    elif score >= 65:
+    else:
         quality = "B"
 
-    return {
-        "score": score,
-        "quality": quality,
-    }
+    return {"score": score, "quality": quality}
 
 
+# =========================================================
+# TRADE LEVELS
+# =========================================================
 def build_trade_levels(
     candles: List[Dict[str, Any]],
     direction: str,
-) -> Dict[str, Optional[float]]:
-    if len(candles) < 10 or direction not in ("LONG", "SHORT"):
-        return {"entry": None, "sl": None, "tp": None}
-
-    last = candles[-1]
-    recent = candles[-10:]
-
-    recent_high = max(x["high"] for x in recent)
-    recent_low = min(x["low"] for x in recent)
-    price = last["close"]
+    ob_zone,
+    fvg_zone,
+):
+    price = candles[-1]["close"]
 
     if direction == "LONG":
-        sl = recent_low
-        risk = price - sl
-        if risk <= 0:
-            return {"entry": price, "sl": None, "tp": None}
-        tp = price + (risk * 2)
-        return {"entry": price, "sl": sl, "tp": tp}
+        entry = ob_zone[0] if ob_zone else price
+        sl = min(x["low"] for x in candles[-10:])
+        tp = entry + (entry - sl) * 2
 
-    sl = recent_high
-    risk = sl - price
-    if risk <= 0:
-        return {"entry": price, "sl": None, "tp": None}
-    tp = price - (risk * 2)
-    return {"entry": price, "sl": sl, "tp": tp}
+    else:
+        entry = ob_zone[1] if ob_zone else price
+        sl = max(x["high"] for x in candles[-10:])
+        tp = entry - (sl - entry) * 2
+
+    return {"entry": entry, "sl": sl, "tp": tp}
 
 
+# =========================================================
+# FINAL ANALYZE ENGINE
+# =========================================================
 def analyze_symbol(
     symbol: str,
-    raw_data_map: Dict[str, Dict[str, Any]],
-    market_candles: Dict[str, List[Dict[str, Any]]],
-) -> Optional[Dict[str, Any]]:
-    raw = raw_data_map.get(symbol)
-    if not raw:
+    raw_data_map,
+    market_candles,
+):
+
+    candles = market_candles.get(symbol)
+    if not candles or len(candles) < 40:
         return None
 
-    candles = market_candles.get(symbol, [])
-    if len(candles) < 20:
-        print(f"{symbol} için yeterli mum yok.")
-        return None
+    price = candles[-1]["close"]
 
-    last_price = candles[-1]["close"]
+    htf = detect_htf_bias_advanced(candles)
 
-    bias = detect_bias(candles)
-    sweep = detect_liquidity_sweep(candles)
-    mss = detect_mss_like(candles)
-    choch = detect_choch_like(candles)
+    structure = detect_mss_choch_advanced(candles, htf)
+    mss = structure["mss"]
+    choch = structure["choch"]
+
+    sweep_data = detect_liquidity_sweep_advanced(candles)
+    sweep = sweep_data["label"]
+
     displacement = detect_displacement(candles)
-    fvg = detect_fvg(candles)
-    premium_discount = detect_premium_discount(candles)
 
-    killzone_label = get_killzone_label()
-    killzone_active = is_killzone_active()
-    smt = detect_smt_for_symbol(symbol, market_candles)
+    fvg_data = detect_fvg_advanced(candles)
+    fvg = fvg_data["label"]
+
+    pd = detect_premium_discount_advanced(candles)
+
+    smt_data = detect_smt_for_symbol_advanced(symbol, market_candles)
+    smt = smt_data["smt"]
 
     direction = "YOK"
 
     if has_required_long_conditions(sweep, mss, choch, displacement):
         direction = "LONG"
+
     elif has_required_short_conditions(sweep, mss, choch, displacement):
         direction = "SHORT"
-    else:
-        return {
-            "symbol": symbol,
-            "price": last_price,
-            "htf_bias": bias,
-            "liquidity_sweep": sweep,
-            "mss": mss,
-            "choch": choch,
-            "fvg": fvg,
-            "premium_discount": premium_discount,
-            "displacement": displacement,
-            "smt": smt,
-            "killzone": killzone_label,
-            "true_order_block": "Yok",
-            "direction": "YOK",
-            "entry": None,
-            "sl": None,
-            "tp": None,
-            "score": 0,
-            "quality": "Yok",
-            "long_score": 0,
-            "short_score": 0,
-            "last_candle_time": candles[-1]["datetime"],
-            "reason": "Zorunlu filtreler sağlanmadı",
-        }
 
-    true_order_block = detect_true_order_block(candles, direction)
-    levels = build_trade_levels(candles, direction)
+    if direction == "YOK":
+        return None
 
-    scored = score_signal(
-        direction=direction,
-        bias=bias,
-        fvg=fvg,
-        premium_discount=premium_discount,
-        smt=smt,
-        killzone_active=killzone_active,
-        true_order_block=true_order_block,
+    ob_data = detect_true_order_block_advanced(candles, direction)
+
+    levels = build_trade_levels(
+        candles,
+        direction,
+        ob_data["zone"],
+        fvg_data["zone"],
     )
 
-    long_score = scored["score"] if direction == "LONG" else 0
-    short_score = scored["score"] if direction == "SHORT" else 0
+    # NO CHASE
+    if is_no_chase(candles, levels["entry"], direction):
+        print(f"{symbol} skip (no-chase)")
+        return None
+
+    scored = score_signal_advanced(
+        direction,
+        htf,
+        fvg,
+        pd,
+        smt,
+        is_killzone_active(),
+        sweep_data["source"],
+        displacement,
+    )
 
     return {
         "symbol": symbol,
-        "price": last_price,
-        "htf_bias": bias,
-        "liquidity_sweep": sweep,
-        "mss": mss,
-        "choch": choch,
-        "fvg": fvg,
-        "premium_discount": premium_discount,
-        "displacement": displacement,
-        "smt": smt,
-        "killzone": killzone_label,
-        "true_order_block": true_order_block,
+        "price": price,
         "direction": direction,
         "entry": levels["entry"],
         "sl": levels["sl"],
         "tp": levels["tp"],
         "score": scored["score"],
         "quality": scored["quality"],
-        "long_score": long_score,
-        "short_score": short_score,
-        "last_candle_time": candles[-1]["datetime"],
-        "reason": "Zorunlu filtreler sağlandı",
+        "htf": htf,
+        "mss": mss,
+        "choch": choch,
+        "smt": smt,
+        "killzone": get_killzone_label(),
     }
 
 
-def format_signal_message(result: Dict[str, Any]) -> str:
-    entry = f"{result['entry']:.5f}" if result["entry"] is not None else "Yok"
-    sl = f"{result['sl']:.5f}" if result["sl"] is not None else "Yok"
-    tp = f"{result['tp']:.5f}" if result["tp"] is not None else "Yok"
-
+# =========================================================
+# MESSAGE
+# =========================================================
+def format_signal_message(r):
     return (
-        "🚨 ANALİZ + SİNYAL RAPORU\n\n"
-        f"Varlık: {result['symbol']}\n"
-        f"Anlık Fiyat: {result['price']:.5f}\n"
-        f"Killzone: {result['killzone']}\n\n"
-        f"HTF Bias: {result['htf_bias']}\n"
-        f"Likidite Sweep: {result['liquidity_sweep']}\n"
-        f"MSS: {result['mss']}\n"
-        f"CHoCH: {result['choch']}\n"
-        f"FVG: {result['fvg']}\n"
-        f"Premium/Discount: {result['premium_discount']}\n"
-        f"Displacement: {result['displacement']}\n"
-        f"SMT: {result['smt']}\n"
-        f"True Order Block: {result['true_order_block']}\n\n"
-        f"İşlem Yönü: {result['direction']}\n"
-        f"Giriş: {entry}\n"
-        f"Zarar Durdur: {sl}\n"
-        f"Kar Al: {tp}\n"
-        f"Güven Skoru: {result['score']}/100\n"
-        f"Sinyal Kalitesi: {result['quality']}\n"
-        f"Long/Short Skor: {result['long_score']} / {result['short_score']}\n"
-        f"Son Mum Zamanı: {result['last_candle_time']}\n"
-        f"Not: {result.get('reason', 'Yok')}"
+        f"🔥 ELITE ICT SIGNAL\n\n"
+        f"{r['symbol']} | {r['direction']}\n\n"
+        f"Entry: {r['entry']:.5f}\n"
+        f"SL: {r['sl']:.5f}\n"
+        f"TP: {r['tp']:.5f}\n\n"
+        f"Score: {r['score']} ({r['quality']})\n\n"
+        f"HTF: {r['htf']}\n"
+        f"MSS: {r['mss']}\n"
+        f"CHoCH: {r['choch']}\n"
+        f"SMT: {r['smt']}\n"
+        f"Session: {r['killzone']}"
     )
 
 
 # =========================================================
 # MAIN RUN
 # =========================================================
-def run_scan() -> int:
-    print("=" * 60)
-    print(f"Cron tarama başladı -> {now_str()}")
-    print(f"TWELVEDATA_API_KEY dolu mu: {'evet' if bool(TWELVEDATA_API_KEY) else 'hayır'}")
-    print(f"TELEGRAM_BOT_TOKEN dolu mu: {'evet' if bool(TELEGRAM_BOT_TOKEN) else 'hayır'}")
-    print(f"TELEGRAM_CHAT_ID dolu mu: {'evet' if bool(TELEGRAM_CHAT_ID) else 'hayır'}")
+def run_scan():
 
-    raw_data_map: Dict[str, Dict[str, Any]] = {}
-    market_candles: Dict[str, List[Dict[str, Any]]] = {}
+    print("=" * 50)
+    print("ELITE SCAN START")
 
-    # Önce tüm marketlerin datasını çek
+    raw_data_map = {}
+    market_candles = {}
+
     for symbol in MARKETS:
         raw = fetch_twelvedata_series(symbol)
         if raw:
             raw_data_map[symbol] = raw
             market_candles[symbol] = build_candles(raw)
-        else:
-            print(f"{symbol} için raw data alınamadı.")
 
-    total_signals = 0
-
-    # Sonra analiz et
     for symbol in MARKETS:
-        try:
-            result = analyze_symbol(symbol, raw_data_map, market_candles)
+        result = analyze_symbol(symbol, raw_data_map, market_candles)
 
-            if not result:
-                print(f"{symbol} analiz üretilemedi.")
-                continue
+        if not result:
+            continue
 
-            print(
-                f"{symbol} -> yön: {result['direction']}, "
-                f"skor: {result['score']}, kalite: {result['quality']}"
-            )
+        if result["score"] >= MIN_SIGNAL_SCORE and result["quality"] in ("A", "A+"):
+            msg = format_signal_message(result)
+            send_telegram_message(msg)
+            print(f"{symbol} SIGNAL")
 
-            if result["direction"] != "YOK" and result["score"] >= MIN_SIGNAL_SCORE and result["quality"] in ("A", "A+"):
-                msg = format_signal_message(result)
-                sent = send_telegram_message(msg)
-                if sent:
-                    total_signals += 1
-                    print(f"{symbol} sinyal gönderildi.")
-                else:
-                    print(f"{symbol} sinyal gönderilemedi.")
-            else:
-                print(f"{symbol} için sinyal yok.")
-
-        except Exception as e:
-            print(f"{symbol} scan hatası: {e}")
-
-    print(f"Cron tarama bitti -> {now_str()} | toplam sinyal: {total_signals}")
-    print("=" * 60)
-    return 0
+    print("SCAN END")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
-    raise SystemExit(run_scan())
+    run_scan()
