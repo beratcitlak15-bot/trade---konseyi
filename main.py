@@ -601,7 +601,7 @@ def detect_htf_bias(candles: List[Dict[str, Any]]) -> str:
 # =========================================================
 # MSS + CHoCH (REAL ICT LOGIC)
 # =========================================================
-def detect_mss_choch(candles: List[Dict[str, Any]]) -> Tuple[str, str]:
+def detect_mss_choch(candles: List[Dict[str, Any]], bias) -> Tuple[str, str]:
     swings = collect_swings(candles, left=2, right=2)
 
     highs = swings["highs"]
