@@ -993,6 +993,27 @@ def is_ob_mitigated(
 
     return False
 
+# =========================================================
+# NO CHASE FILTER
+# =========================================================
+def is_no_chase(candles: List[Dict[str, Any]], entry: float, direction: str) -> bool:
+    if len(candles) < 3 or entry is None:
+        return False
+
+    last_price = candles[-1]["close"]
+    avg_rng = average_range(candles[-10:], 10)
+
+    if avg_rng == 0:
+        return False
+
+    distance = abs(last_price - entry)
+
+    # fiyat çok uzaksa (geç kalınmış trade)
+    if distance > avg_rng * 1.5:
+        return True
+
+    return False
+
 
 # =========================================================
 # FOREX / METAL ANALYZE ENGINE (SNIPER OB ENTRY)
