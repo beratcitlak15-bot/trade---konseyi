@@ -125,6 +125,29 @@ def is_killzone_active(dt: Optional[datetime] = None) -> bool:
 
 
 # =========================================================
+# MARKET OPEN FILTER
+# =========================================================
+def is_forex_market_open() -> bool:
+    now = now_utc()
+    wd = now.weekday()  # Mon=0 ... Sun=6
+    hour = now.hour
+
+    # Cumartesi tamamen kapalı
+    if wd == 5:
+        return False
+
+    # Cuma UTC 21:00 sonrası kapalı
+    if wd == 4 and hour >= 21:
+        return False
+
+    # Pazar UTC 21:00 öncesi kapalı
+    if wd == 6 and hour < 21:
+        return False
+
+    return True
+
+
+# =========================================================
 # FILE / CACHE HELPERS
 # =========================================================
 def ensure_cache_dir() -> None:
@@ -254,26 +277,87 @@ def get_series_with_policy(symbol: str, interval: str) -> Optional[Dict[str, Any
 # TRADINGVIEW STATE PLACEHOLDER
 # =========================================================
 def get_tradingview_state() -> Dict[str, Any]:
+    data = load_json_file(TRADINGVIEW_STATE_FILE)
+
+    if not data:
+        return {
+            "updated_at": None,
+            "dxy_bias": "Yok",
+            "index_smt": "Yok",
+            "us100": {},
+            "sp500": {},
+        }
+
+    return {
+        "updated_at": data.get("updated_at"),
+        "dxy_bias": data.get("dxy_bias", "Yok"),
+        "index_smt": data.get("index_smt", "Yok"),
+        "us100": data.get("us100", {}),
+        "sp500": data.get("sp500", {}),
+    }
+
+# =========================================================
+# WEEKEND FILTER (EKLENTİ - SADECE BU EKLENDİ)
+# =========================================================
+def is_weekend_market_closed(dt: Optional[datetime] = None) -> bool:
+    x = dt or now_utc()
+
+    # Python weekday:
+    # Monday = 0 ... Sunday = 6
+    day = x.weekday()
+    hour = x.hour
+
+    # Cuma 22:00 sonrası → market kapanıyor
+    if day == 4 and hour >= 22:
+        return True
+
+    # Cumartesi → tamamen kapalı
+    if day == 5:
+        return True
+
+    # Pazar → 22:00'a kadar kapalı
+    if day == 6 and hour < 22:
+        return True
+
+    return False
+
+
+# =========================================================
+# NO-CHASE FILTER (EKLENTİ - SENİN STRATEJİ)
+# =========================================================
+def is_no_chase(
+    candles_5m: List[Dict[str, Any]],
+    entry_price: float,
+    direction: str,
+) -> bool:
+    """
+    Fiyat entry'den çok uzaksa trade alma.
+    """
+
+    if len(candles_5m) < 1:
+        return False
+
+    current_price = candles_5m[-1]["close"]
+
+    # tolerans: %0.15 (senin sniper stiline uygun)
+    tolerance = entry_price * 0.0015
+
+    if direction == "LONG":
+        return current_price > (entry_price + tolerance)
+
+    if direction == "SHORT":
+        return current_price < (entry_price - tolerance)
+
+    return False
+
+
+# =========================================================
+# TRADINGVIEW STATE PLACEHOLDER
+# =========================================================
+def get_tradingview_state() -> Dict[str, Any]:
     """
     TradingView tarafı daha sonra webhook ile bu dosyaya yazacak.
     Şimdilik bot bu dosyayı okur.
-
-    Beklenen örnek yapı:
-    {
-      "updated_at": "2026-03-20T08:00:00Z",
-      "dxy_bias": "Yükseliş",
-      "index_smt": "Bullish SMT",
-      "us100": {
-        "direction": "LONG",
-        "score": 88,
-        "quality": "A+"
-      },
-      "sp500": {
-        "direction": "LONG",
-        "score": 84,
-        "quality": "A"
-      }
-    }
     """
     data = load_json_file(TRADINGVIEW_STATE_FILE)
 
@@ -347,7 +431,6 @@ def average_range(candles: List[Dict[str, Any]], count: int = 10) -> float:
     if not sample:
         return 0.0
     return sum(candle_range(x) for x in sample) / len(sample)
-
 
 # =========================================================
 # SWING / PIVOT ENGINE
@@ -540,6 +623,8 @@ def equal_lows_exists(
                 return min(a, b)
 
     return None
+
+
 # =========================================================
 # DISPLACEMENT (PRO LEVEL)
 # =========================================================
@@ -560,7 +645,6 @@ def detect_displacement(candles: List[Dict[str, Any]]) -> str:
     body_ratio = body / avg_body
     range_ratio = total_range / avg_range_val
 
-    # güçlü impuls mumu
     if body_ratio >= 2.0 and range_ratio >= 1.5:
         return "Güçlü"
 
@@ -585,12 +669,10 @@ def detect_htf_bias(candles: List[Dict[str, Any]]) -> str:
     if not h2 or not l2:
         return "Nötr"
 
-    # Higher High + Higher Low
     if h1 and l1:
         if h2["price"] > h1["price"] and l2["price"] > l1["price"]:
             return "Yükseliş"
 
-    # Lower High + Lower Low
     if h1 and l1:
         if h2["price"] < h1["price"] and l2["price"] < l1["price"]:
             return "Düşüş"
@@ -618,15 +700,12 @@ def detect_mss_choch(candles: List[Dict[str, Any]], bias) -> Tuple[str, str]:
     mss = "Yok"
     choch = "Yok"
 
-    # Bullish MSS → son high kırıldı
     if h2 and last_close > h2["price"]:
         mss = "Bullish MSS"
 
-    # Bearish MSS → son low kırıldı
     if l2 and last_close < l2["price"]:
         mss = "Bearish MSS"
 
-    # CHoCH = structure flip
     if h1 and l2:
         if last_close > h1["price"]:
             choch = "Bullish CHoCH"
@@ -646,17 +725,14 @@ def detect_liquidity_sweep(candles: List[Dict[str, Any]]) -> str:
         return "Yok"
 
     last = candles[-1]
-
     recent = candles[-8:-1]
 
     prev_high = max(x["high"] for x in recent)
     prev_low = min(x["low"] for x in recent)
 
-    # üst sweep → wick yukarı, close aşağı
     if last["high"] > prev_high and last["close"] < prev_high:
         return "Üst likidite sweep"
 
-    # alt sweep → wick aşağı, close yukarı
     if last["low"] < prev_low and last["close"] > prev_low:
         return "Alt likidite sweep"
 
@@ -672,11 +748,9 @@ def detect_fvg(candles: List[Dict[str, Any]]) -> str:
 
     a, b, c = candles[-3], candles[-2], candles[-1]
 
-    # bullish gap
     if c["low"] > a["high"]:
         return "Bullish FVG"
 
-    # bearish gap
     if c["high"] < a["low"]:
         return "Bearish FVG"
 
@@ -705,7 +779,6 @@ def detect_pd(candles: List[Dict[str, Any]]) -> str:
 
     return "Nötr"
 
-
 # =========================================================
 # ORDER BLOCK (SNIPER CORE)
 # =========================================================
@@ -713,13 +786,11 @@ def detect_order_block(
     candles: List[Dict[str, Any]],
     direction: str,
 ) -> Optional[Dict[str, float]]:
-
     if len(candles) < 10:
         return None
 
     lookback = candles[-10:-1]
 
-    # LONG → son bearish candle
     if direction == "LONG":
         for c in reversed(lookback):
             if c["close"] < c["open"]:
@@ -728,7 +799,6 @@ def detect_order_block(
                     "high": c["high"],
                 }
 
-    # SHORT → son bullish candle
     if direction == "SHORT":
         for c in reversed(lookback):
             if c["close"] > c["open"]:
@@ -764,8 +834,6 @@ def determine_direction(
     choch: str,
     displacement: str,
 ) -> str:
-
-    # LONG
     if (
         sweep == "Alt likidite sweep"
         and (mss == "Bullish MSS" or choch == "Bullish CHoCH")
@@ -773,7 +841,6 @@ def determine_direction(
     ):
         return "LONG"
 
-    # SHORT
     if (
         sweep == "Üst likidite sweep"
         and (mss == "Bearish MSS" or choch == "Bearish CHoCH")
@@ -796,7 +863,6 @@ def score_signal(
     dxy_bias: str,
     killzone_active: bool,
 ) -> Tuple[int, str]:
-
     score = 50
 
     if direction == "LONG":
@@ -834,6 +900,7 @@ def score_signal(
         quality = "A"
 
     return score, quality
+
 
 # =========================================================
 # DATA PREP
@@ -908,7 +975,6 @@ def is_ob_mitigated(
     last = candles_5m[-1]
     prev = candles_5m[-2]
 
-    # Son iki 5m mumdan biri zone'a değmiş mi?
     touched = (
         (last["low"] <= ob["high"] and last["high"] >= ob["low"])
         or (prev["low"] <= ob["high"] and prev["high"] >= ob["low"])
@@ -917,12 +983,10 @@ def is_ob_mitigated(
     if not touched:
         return False
 
-    # LONG için zone içinde rejection
     if direction == "LONG":
         if last["close"] > last["open"] and last["close"] >= ob["low"]:
             return True
 
-    # SHORT için zone içinde rejection
     if direction == "SHORT":
         if last["close"] < last["open"] and last["close"] <= ob["high"]:
             return True
@@ -957,17 +1021,14 @@ def analyze_forex_symbol(
 
     current_price = candles_5m[-1]["close"]
 
-    # HTF bias
     h1_bias = detect_htf_bias(candles_1h)
     h4_bias = detect_htf_bias(candles_4h)
     w1_bias = detect_htf_bias(candles_1w)
 
-    # Ana context
     bias = h1_bias if h1_bias != "Nötr" else h4_bias
     if bias == "Nötr":
         bias = w1_bias
 
-    # 15m setup
     mss, choch = detect_mss_choch(candles_15m, bias)
     sweep = detect_liquidity_sweep(candles_15m)
     displacement = detect_displacement(candles_15m)
@@ -978,32 +1039,23 @@ def analyze_forex_symbol(
     if direction == "YOK":
         return None
 
-    # OB bul
     ob = detect_order_block(candles_15m, direction)
     if not ob:
         return None
 
-    # EN KRİTİK KURAL:
-    # setup var ama fiyat OB'ye geri gelmemişse trade YOK
     if not is_ob_mitigated(candles_5m, ob, direction):
         print(f"{market_name} -> setup var ama OB mitigation yok")
         return None
 
-    # SL/TP sadece OB bazlı
     levels = build_trade_levels_from_ob(candles_15m, direction, ob)
     if levels["entry"] is None or levels["sl"] is None or levels["tp"] is None:
         return None
 
-    # no-chase
     if is_no_chase(candles_5m, levels["entry"], direction):
         print(f"{market_name} -> skip (no-chase)")
         return None
 
-    # DXY sadece EURUSD ve XAUUSD için
     dxy_bias = get_dxy_bias(tv_state) if market_name in ("EUR/USD", "XAU/USD") else "Yok"
-
-    # Forex SMT burada placeholder yok; şimdilik local mantık kullanmıyoruz
-    # çünkü ana dış SMT yapısı TradingView tarafına taşınacak
     smt = "Yok"
 
     score, quality = score_signal(
@@ -1200,12 +1252,17 @@ def run_scan() -> int:
     print(f"Telegram chat id var mı: {'evet' if bool(TELEGRAM_CHAT_ID) else 'hayır'}")
     print(f"TradingView state file: {TRADINGVIEW_STATE_FILE}")
 
+    if is_weekend_market_closed():
+        print("Hafta sonu market kapalı. Analiz yapılmadı.")
+        print(f"ELITE SNIPER SCAN END -> {now_str()} | toplam sinyal: 0")
+        print("=" * 60)
+        return 0
+
     mtf_map = build_forex_mtf_map()
     tv_state = get_tradingview_state()
 
     total_signals = 0
 
-    # 1) Forex / metal tarafı (TwelveData)
     for market in FOREX_METALS:
         name = market["name"]
         result = analyze_forex_symbol(name, mtf_map, tv_state)
@@ -1231,7 +1288,6 @@ def run_scan() -> int:
         else:
             print(f"{name} -> setup var ama filtreyi geçemedi")
 
-    # 2) TradingView tarafı (US100 / SP500 / DXY bias)
     tv_results = analyze_tradingview_indices(tv_state)
 
     for result in tv_results:
