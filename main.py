@@ -350,35 +350,6 @@ def is_no_chase(
 
     return False
 
-
-# =========================================================
-# TRADINGVIEW STATE PLACEHOLDER
-# =========================================================
-def get_tradingview_state() -> Dict[str, Any]:
-    """
-    TradingView tarafı daha sonra webhook ile bu dosyaya yazacak.
-    Şimdilik bot bu dosyayı okur.
-    """
-    data = load_json_file(TRADINGVIEW_STATE_FILE)
-
-    if not data:
-        return {
-            "updated_at": None,
-            "dxy_bias": "Yok",
-            "index_smt": "Yok",
-            "us100": {},
-            "sp500": {},
-        }
-
-    return {
-        "updated_at": data.get("updated_at"),
-        "dxy_bias": data.get("dxy_bias", "Yok"),
-        "index_smt": data.get("index_smt", "Yok"),
-        "us100": data.get("us100", {}),
-        "sp500": data.get("sp500", {}),
-    }
-
-
 # =========================================================
 # CANDLES
 # =========================================================
@@ -1012,8 +983,7 @@ def is_no_chase(candles: List[Dict[str, Any]], entry: float, direction: str) -> 
     if distance > avg_rng * 1.5:
         return True
 
-    return False
-
+    return false
 
 # =========================================================
 # FOREX / METAL ANALYZE ENGINE (SNIPER OB ENTRY)
@@ -1042,14 +1012,17 @@ def analyze_forex_symbol(
 
     current_price = candles_5m[-1]["close"]
 
+    # HTF bias
     h1_bias = detect_htf_bias(candles_1h)
     h4_bias = detect_htf_bias(candles_4h)
     w1_bias = detect_htf_bias(candles_1w)
 
+    # Ana context bias
     bias = h1_bias if h1_bias != "Nötr" else h4_bias
     if bias == "Nötr":
         bias = w1_bias
 
+    # 15m setup
     mss, choch = detect_mss_choch(candles_15m, bias)
     sweep = detect_liquidity_sweep(candles_15m)
     displacement = detect_displacement(candles_15m)
@@ -1060,23 +1033,43 @@ def analyze_forex_symbol(
     if direction == "YOK":
         return None
 
+    # OB bul
     ob = detect_order_block(candles_15m, direction)
     if not ob:
         return None
 
+    # Setup var ama fiyat OB'ye dönmemişse trade yok
     if not is_ob_mitigated(candles_5m, ob, direction):
         print(f"{market_name} -> setup var ama OB mitigation yok")
         return None
 
+    # OB bazlı levels üret
     levels = build_trade_levels_from_ob(candles_15m, direction, ob)
     if levels["entry"] is None or levels["sl"] is None or levels["tp"] is None:
         return None
 
+    # =========================================================
+    # OB ENTRY SAFETY CHECK
+    # =========================================================
+    if direction == "SHORT":
+        if levels["entry"] != ob["high"]:
+            print(f"{market_name} -> OB short entry hatalı, sinyal iptal")
+            return None
+
+    if direction == "LONG":
+        if levels["entry"] != ob["low"]:
+            print(f"{market_name} -> OB long entry hatalı, sinyal iptal")
+            return None
+
+    # No-chase filtresi
     if is_no_chase(candles_5m, levels["entry"], direction):
         print(f"{market_name} -> skip (no-chase)")
         return None
 
+    # DXY sadece EURUSD ve XAUUSD için aktif
     dxy_bias = get_dxy_bias(tv_state) if market_name in ("EUR/USD", "XAU/USD") else "Yok"
+
+    # Şimdilik forex SMT local kullanılmıyor
     smt = "Yok"
 
     score, quality = score_signal(
@@ -1297,9 +1290,30 @@ def run_scan() -> int:
             f"skor: {result['score']}, kalite: {result['quality']}"
         )
 
+        # =========================================================
+        # FINAL OB ENTRY CHECK BEFORE TELEGRAM
+        # =========================================================
+        if result["direction"] == "SHORT":
+            if result["entry"] != result["ob_high"]:
+                print(f"{name} -> entry OB high ile uyuşmuyor, sinyal gönderilmedi")
+                continue
+
+        if result["direction"] == "LONG":
+            if result["entry"] != result["ob_low"]:
+                print(f"{name} -> entry OB low ile uyuşmuyor, sinyal gönderilmedi")
+                continue
+
         if result["score"] >= MIN_SIGNAL_SCORE and result["quality"] in ("A", "A+"):
             msg = format_signal_message(result)
             sent = send_telegram_message(msg)
+
+            if sent:
+                total_signals += 1
+                print(f"{name} -> SIGNAL GÖNDERİLDİ")
+            else:
+                print(f"{name} -> sinyal gönderilemedi")
+        else:
+            print(f"{name} -> setup var ama filtreyi geçemedi")
 
             if sent:
                 total_signals += 1
