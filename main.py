@@ -783,6 +783,41 @@ def detect_order_block(
 
 def is_price_in_ob(price: float, ob: Dict[str, float]) -> bool:
     return ob["low"] <= price <= ob["high"]
+# =========================================================
+# PULLBACK ENGINE (SNIPER WAIT SYSTEM)
+# =========================================================
+def is_pullback_valid(
+    candles_5m: List[Dict[str, Any]],
+    direction: str,
+    ob: Dict[str, float],
+) -> bool:
+    if len(candles_5m) < 6:
+        return False
+
+    recent = candles_5m[-6:]
+
+    ob_low = ob["low"]
+    ob_high = ob["high"]
+
+    touched = False
+
+    for c in recent:
+        if c["low"] <= ob_high and c["high"] >= ob_low:
+            touched = True
+            break
+
+    if not touched:
+        return False
+
+    last = candles_5m[-1]
+
+    if direction == "LONG":
+        return last["close"] > last["open"]
+
+    if direction == "SHORT":
+        return last["close"] < last["open"]
+
+    return False
 
 
 # =========================================================
