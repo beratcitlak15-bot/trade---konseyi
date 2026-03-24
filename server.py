@@ -1,117 +1,67 @@
 from flask import Flask, request, jsonify
-import json
-import os
-from datetime import datetime, UTC
+import requests
+from datetime import datetime
 
 app = Flask(__name__)
 
-STATE_FILE = "tradingview_state.json"
+# 🔥 TELEGRAM AYARLARI
+BOT_TOKEN = "8626229562:AAFRph72ngdmySSHJ5L2iF97xFQhEuh6K3w"
+CHAT_ID = "8463420441"
 
-# =========================
-# STATE LOAD / SAVE
-# =========================
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={
+            "chat_id": CHAT_ID,
+            "text": msg
+        })
+    except Exception as e:
+        print("Telegram hata:", e)
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {
-            "updated_at": None,
-            "dxy_bias": "Yok",
-            "index_smt": "Yok",
-            "us100": {},
-            "sp500": {}
-        }
-    with open(STATE_FILE, "r") as f:
-        return json.load(f)
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-
-# =========================
-# ROUTES
-# =========================
-
+# ✅ TEST
 @app.route("/", methods=["GET"])
 def home():
     return "Webhook aktif", 200
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
-
-# =========================
-# WEBHOOK
-# =========================
-
+# ✅ WEBHOOK
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    print("------ WEBHOOK GELDİ ------")
-
-    raw_data = request.data
-    print("RAW DATA:", raw_data)
-
     try:
         data = request.get_json(force=True)
-    except Exception:
-        data = json.loads(raw_data)
+        print("GELEN DATA:", data)
 
-    print("PARSED DATA:", data)
+        symbol = data.get("symbol", "YOK")
+        direction = data.get("direction", "YOK")
+        entry = data.get("entry", "YOK")
+        sl = data.get("sl", "YOK")
+        tp = data.get("tp", "YOK")
+        score = data.get("score", "")
+        quality = data.get("quality", "")
 
-    state = load_state()
-    print("STATE BEFORE:", state)
+        message = f"""
+🔥 YENİ SİNYAL GELDİ
 
-    # ZAMAN GÜNCELLE
-    state["updated_at"] = datetime.now(UTC).isoformat()
+📊 {symbol}
+📈 Yön: {direction}
 
-    symbol = str(data.get("symbol", "")).upper()
-    event = str(data.get("event", "")).lower()
+🎯 Entry: {entry}
+🛑 SL: {sl}
+💰 TP: {tp}
 
-    # =========================
-    # DXY
-    # =========================
-    if symbol == "DXY" or event == "dxy_state":
-        state["dxy_bias"] = data.get("dxy_bias", state["dxy_bias"])
-        save_state(state)
+⭐ Score: {score}
+💎 Quality: {quality}
 
-        print("✅ DXY GÜNCELLENDİ")
-        print("STATE AFTER:", state)
+⏰ {datetime.utcnow()}
+"""
 
-        return jsonify({"status": "ok", "type": "dxy"}), 200
+        send_telegram(message)
 
-    # =========================
-    # US100 / US500 SIGNAL
-    # =========================
-    elif symbol in ["US100", "US500"] or event == "signal":
+        return jsonify({"status": "ok"}), 200
 
-        signal_data = {
-            "symbol": symbol,
-            "direction": data.get("direction"),
-            "price": data.get("price"),
-            "entry": data.get("entry"),
-            "sl": data.get("sl"),
-            "tp": data.get("tp"),
-            "score": data.get("score"),
-            "quality": data.get("quality"),
-            "time": state["updated_at"]
-        }
+    except Exception as e:
+        print("HATA:", e)
+        return jsonify({"error": str(e)}), 500
 
-        if symbol == "US100":
-            state["us100"] = signal_data
-        elif symbol == "US500":
-            state["sp500"] = signal_data
 
-        save_state(state)
-
-        print("🔥 SIGNAL KAYDEDİLDİ:", signal_data)
-        print("STATE AFTER:", state)
-
-        return jsonify({"status": "ok", "type": "signal"}), 200
-
-    # =========================
-    # UNKNOWN
-    # =========================
-    else:
-        print("⚠️ TANINMAYAN DATA:", data)
-        return jsonify({"status": "ignored"}), 200
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
