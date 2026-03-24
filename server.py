@@ -52,14 +52,20 @@ def home():
 def health():
     return jsonify({"status": "ok"}), 200
 
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
-    print("GELEN DATA:", data)
+    import json
 
-    symbol = data.get("symbol")
- 
+    raw_data = request.data
+    print("RAW DATA:", raw_data)
+
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        data = json.loads(raw_data)
+
+    print("PARSED DATA:", data)
+
     state = load_state()
     state["updated_at"] = datetime.utcnow().isoformat()
 
