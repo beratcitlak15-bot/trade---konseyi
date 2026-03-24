@@ -1078,6 +1078,10 @@ def analyze_forex_symbol(
         print(f"{market_name} -> setup var ama OB mitigation yok")
         return None
 
+if not is_pullback_valid(candles_5m, direction, ob):
+        print(f"{market_name} -> setup var ama valid pullback yok")
+        return None
+
     # OB bazlı levels üret
     levels = build_trade_levels_from_ob(candles_15m, direction, ob)
     if levels["entry"] is None or levels["sl"] is None or levels["tp"] is None:
