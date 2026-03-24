@@ -1,7 +1,20 @@
 {
-  "updated_at": null,
-  "dxy_bias": "Yok",
-  "index_smt": "Yok",
-  "us100": {},
-  "sp500": {}
+  "dxy_bias": "Yükseliş",
+  "index_smt": "Bullish SMT",
+  "us100": {
+    "direction": "LONG",
+    "entry": 100,
+    "sl": 90,
+    "tp": 120,
+    "score": 85,
+    "quality": "A"
+  },
+  "sp500": {
+    "direction": "SHORT",
+    "entry": 200,
+    "sl": 210,
+    "tp": 180,
+    "score": 82,
+    "quality": "A"
+  }
 }
