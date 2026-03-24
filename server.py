@@ -55,7 +55,11 @@ def health():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(silent=True) or {}
+    data = request.json
+    print("GELEN DATA:", data)
+
+    symbol = data.get("symbol")
+ 
     state = load_state()
     state["updated_at"] = datetime.utcnow().isoformat()
 
