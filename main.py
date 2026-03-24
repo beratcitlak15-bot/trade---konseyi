@@ -1020,71 +1020,71 @@ def is_no_chase(candles: List[Dict[str, Any]], entry: float, direction: str) -> 
 
     return false
 
-# =========================================================
-# FOREX / METAL ANALYZE ENGINE (SNIPER OB ENTRY)
-# =========================================================
-def analyze_forex_symbol(
-    market_name: str,
-    mtf_map: Dict[str, Dict[str, List[Dict[str, Any]]]],
-    tv_state: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    tfs = mtf_map.get(market_name, {})
-
-    candles_5m = tfs.get("5min", [])
-    candles_15m = tfs.get("15min", [])
-    candles_1h = tfs.get("1h", [])
-    candles_4h = tfs.get("4h", [])
-    candles_1w = tfs.get("1week", [])
-
-    if (
-        len(candles_5m) < 20
-        or len(candles_15m) < 30
-        or len(candles_1h) < 20
-        or len(candles_4h) < 10
-        or len(candles_1w) < 5
-    ):
-        return None
-
-    current_price = candles_5m[-1]["close"]
-
-    # HTF bias
-    h1_bias = detect_htf_bias(candles_1h)
-    h4_bias = detect_htf_bias(candles_4h)
-    w1_bias = detect_htf_bias(candles_1w)
-
-    # Ana context bias
-    bias = h1_bias if h1_bias != "Nötr" else h4_bias
-    if bias == "Nötr":
-        bias = w1_bias
-
-    # 15m setup
-    mss, choch = detect_mss_choch(candles_15m, bias)
-    sweep = detect_liquidity_sweep(candles_15m)
-    displacement = detect_displacement(candles_15m)
-    fvg = detect_fvg(candles_15m)
-    pd = detect_pd(candles_15m)
-
-    direction = determine_direction(sweep, mss, choch, displacement)
-    if direction == "YOK":
-        return None
-
-    # OB bul
-    ob = detect_order_block(candles_15m, direction)
-    if not ob:
-        return None
-
-    # Setup var ama fiyat OB'ye dönmemişse trade yok
-    if not is_ob_mitigated(candles_5m, ob, direction):
-        print(f"{market_name} -> setup var ama OB mitigation yok")
-        return None
-
-if not is_pullback_valid(candles_5m, direction, ob):
-        print(f"{market_name} -> setup var ama valid pullback yok")
-        return None
-
-    # OB bazlı levels üret
-    levels = build_trade_levels_from_ob(candles_15m, direction, ob)
-    if levels["entry"] is None or levels["sl"] is None or levels["tp"] is None:
+# =========================================================  
+# FOREX / METAL ANALYZE ENGINE (SNIPER OB ENTRY)  
+# =========================================================  
+def analyze_forex_symbol(  
+    market_name: str,  
+    mtf_map: Dict[str, Dict[str, List[Dict[str, Any]]]],  
+    tv_state: Dict[str, Any],  
+) -> Optional[Dict[str, Any]]:  
+    tfs = mtf_map.get(market_name, {})  
+  
+    candles_5m = tfs.get("5min", [])  
+    candles_15m = tfs.get("15min", [])  
+    candles_1h = tfs.get("1h", [])  
+    candles_4h = tfs.get("4h", [])  
+    candles_1w = tfs.get("1week", [])  
+  
+    if (  
+        len(candles_5m) < 20  
+        or len(candles_15m) < 30  
+        or len(candles_1h) < 20  
+        or len(candles_4h) < 10  
+        or len(candles_1w) < 5  
+    ):  
+        return None  
+  
+    current_price = candles_5m[-1]["close"]  
+  
+    # HTF bias  
+    h1_bias = detect_htf_bias(candles_1h)  
+    h4_bias = detect_htf_bias(candles_4h)  
+    w1_bias = detect_htf_bias(candles_1w)  
+  
+    # Ana context bias  
+    bias = h1_bias if h1_bias != "Nötr" else h4_bias  
+    if bias == "Nötr":  
+        bias = w1_bias  
+  
+    # 15m setup  
+    mss, choch = detect_mss_choch(candles_15m, bias)  
+    sweep = detect_liquidity_sweep(candles_15m)  
+    displacement = detect_displacement(candles_15m)  
+    fvg = detect_fvg(candles_15m)  
+    pd = detect_pd(candles_15m)  
+  
+    direction = determine_direction(sweep, mss, choch, displacement)  
+    if direction == "YOK":  
+        return None  
+  
+    # OB bul  
+    ob = detect_order_block(candles_15m, direction)  
+    if not ob:  
+        return None  
+  
+    # Setup var ama fiyat OB'ye dönmemişse trade yok  
+    if not is_ob_mitigated(candles_5m, ob, direction):  
+        print(f"{market_name} -> setup var ama OB mitigation yok")  
+        return None  
+  
+    if not is_pullback_valid(candles_5m, direction, ob):  
+        print(f"{market_name} -> setup var ama valid pullback yok")  
+        return None  
+  
+    # OB bazlı levels üret  
+    levels = build_trade_levels_from_ob(candles_15m, direction, ob)  
+    if levels["entry"] is None or levels["sl"] is None or levels["tp"] is None:  
         return None
 
     # =========================================================
