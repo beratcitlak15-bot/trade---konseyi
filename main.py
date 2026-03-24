@@ -1290,8 +1290,45 @@ def run_scan() -> int:
             f"skor: {result['score']}, kalite: {result['quality']}"
         )
 
+        
+# =========================================================
+# RUN
+# =========================================================
+def run_scan() -> int:
+    print("=" * 60)
+    print(f"ELITE SNIPER SCAN START -> {now_str()}")
+
+    print(f"TwelveData key var mı: {'evet' if bool(TWELVEDATA_API_KEY) else 'hayır'}")
+    print(f"Telegram token var mı: {'evet' if bool(TELEGRAM_BOT_TOKEN) else 'hayır'}")
+    print(f"Telegram chat id var mı: {'evet' if bool(TELEGRAM_CHAT_ID) else 'hayır'}")
+    print(f"TradingView state file: {TRADINGVIEW_STATE_FILE}")
+
+    if is_weekend_market_closed():
+        print("Hafta sonu market kapalı. Analiz yapılmadı.")
+        print(f"ELITE SNIPER SCAN END -> {now_str()} | toplam sinyal: 0")
+        print("=" * 60)
+        return 0
+
+    mtf_map = build_forex_mtf_map()
+    tv_state = get_tradingview_state()
+
+    total_signals = 0
+
+    for market in FOREX_METALS:
+        name = market["name"]
+        result = analyze_forex_symbol(name, mtf_map, tv_state)
+
+        if not result:
+            print(f"{name} -> setup yok")
+            continue
+
+        print(
+            f"{name} -> yön: {result['direction']}, "
+            f"skor: {result['score']}, kalite: {result['quality']}"
+        )
+
         # =========================================================
-        # FINAL OB ENTRY CHECK BEFORE TELEGRAM
+        # FINAL OB ENTRY CHECK (EKLENMESİ GEREKEN)
         # =========================================================
         if result["direction"] == "SHORT":
             if result["entry"] != result["ob_high"]:
@@ -1303,17 +1340,12 @@ def run_scan() -> int:
                 print(f"{name} -> entry OB low ile uyuşmuyor, sinyal gönderilmedi")
                 continue
 
+        # =========================================================
+        # TELEGRAM
+        # =========================================================
         if result["score"] >= MIN_SIGNAL_SCORE and result["quality"] in ("A", "A+"):
             msg = format_signal_message(result)
             sent = send_telegram_message(msg)
-
-            if sent:
-                total_signals += 1
-                print(f"{name} -> SIGNAL GÖNDERİLDİ")
-            else:
-                print(f"{name} -> sinyal gönderilemedi")
-        else:
-            print(f"{name} -> setup var ama filtreyi geçemedi")
 
             if sent:
                 total_signals += 1
@@ -1348,7 +1380,6 @@ def run_scan() -> int:
     print(f"ELITE SNIPER SCAN END -> {now_str()} | toplam sinyal: {total_signals}")
     print("=" * 60)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(run_scan())
