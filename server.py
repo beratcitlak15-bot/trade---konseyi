@@ -7,13 +7,16 @@ app = Flask(__name__)
 
 STATE_FILE = "tradingview_state.json"
 
+
 @app.route("/", methods=["GET"])
 def home():
     return "Webhook aktif", 200
 
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -33,6 +36,7 @@ def webhook():
     print("Webhook geldi:", state)
 
     return jsonify({"status": "ok"}), 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
