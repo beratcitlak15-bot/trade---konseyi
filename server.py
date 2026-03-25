@@ -38,7 +38,23 @@ def webhook():
         score = data.get("score", "")
         quality = data.get("quality", "")
 
-        message = f"""
+        event = str(data.get("event", "")).lower()
+        symbol = data.get("symbol", "YOK")
+        direction = data.get("direction", "YOK")
+        entry = data.get("entry", "YOK")
+        sl = data.get("sl", "YOK")
+        tp = data.get("tp", "YOK")
+        score = data.get("score", "")
+        quality = data.get("quality", "")
+
+        # ❌ DXY STATE → TELEGRAM'A GÖNDERME
+        if event == "dxy_state":
+            print("DXY state geldi, Telegram'a gönderilmedi:", data)
+            return jsonify({"status": "ignored_dxy_state"}), 200
+
+        # ✅ SADECE GERÇEK SIGNAL GÖNDER
+        if event == "signal":
+            message = f"""
 🔥 YENİ SİNYAL GELDİ
 
 📊 {symbol}
@@ -53,10 +69,10 @@ def webhook():
 
 ⏰ {datetime.utcnow()}
 """
+            send_telegram(message)
+            return jsonify({"status": "ok"}), 200
 
-        send_telegram(message)
-
-        return jsonify({"status": "ok"}), 200
+        return jsonify({"status": "ignored"}), 200
 
     except Exception as e:
         print("HATA:", e)
