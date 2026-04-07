@@ -1124,8 +1124,6 @@ def format_signal_message(r: Dict[str, Any]) -> str:
 # RUN
 # =========================================================
 def run_scan() -> int:
-    send_telegram_message("Test mesajı geldi")
-    return 0
     print("=" * 60)
     print(f"ELITE SNIPER SCAN START -> {now_str()}")
 
