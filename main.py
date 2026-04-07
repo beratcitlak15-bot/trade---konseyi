@@ -16,7 +16,7 @@ TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 # =========================================================
 # SETTINGS
 # =========================================================
-MIN_SIGNAL_SCORE = 80
+MIN_SIGNAL_SCORE = 75
 CACHE_DIR = ".mtf_cache"
 
 # SADECE TWELVEDATA'DAN ÇEKİLECEK PARİTELER
@@ -815,7 +815,7 @@ def score_signal(
 
     if score >= 90:
         quality = "A+"
-    elif score >= 80:
+    elif score >= 75:
         quality = "A"
 
     return score, quality
