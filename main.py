@@ -16,7 +16,7 @@ TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 # =========================================================
 # SETTINGS
 # =========================================================
-MIN_SIGNAL_SCORE = 75
+MIN_SIGNAL_SCORE = 70
 CACHE_DIR = ".mtf_cache"
 BOT_STATE_FILE = "bot_state.json"
 
@@ -42,9 +42,9 @@ SIGNAL_COOLDOWN_SECONDS = 60 * 60
 MAX_ACTIVE_SIGNAL_AGE_SECONDS = 60 * 60 * 24
 
 MAX_BARS_AFTER_MITIGATION = 2
-ENTRY_DISTANCE_MAX_MULTIPLIER = 0.45
-TP_PROGRESS_BLOCK_THRESHOLD = 0.30
-MIN_RR_REQUIRED = 1.8
+ENTRY_DISTANCE_MAX_MULTIPLIER = 0.65
+TP_PROGRESS_BLOCK_THRESHOLD = 0.45
+MIN_RR_REQUIRED = 1.6
 
 SMT_RELATIONS: Dict[str, List[Tuple[str, str]]] = {
     "EUR/USD": [("GBP/USD", "positive"), ("USD/CHF", "inverse")],
@@ -1215,7 +1215,7 @@ def score_signal(
     quality = "Yok"
     if score >= 88:
         quality = "A+"
-    elif score >= 75:
+    elif score >= 70:
         quality = "A"
 
     return score, quality, notes
