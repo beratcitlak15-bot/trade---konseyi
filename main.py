@@ -41,7 +41,7 @@ TF_RULES = {
 SIGNAL_COOLDOWN_SECONDS = 60 * 60
 MAX_ACTIVE_SIGNAL_AGE_SECONDS = 60 * 60 * 24
 
-MAX_BARS_AFTER_MITIGATION = 4
+MAX_BARS_AFTER_MITIGATION = 3
 ENTRY_DISTANCE_MAX_MULTIPLIER = 0.80
 TP_PROGRESS_BLOCK_THRESHOLD = 0.55
 MIN_RR_REQUIRED = 1.4
@@ -929,13 +929,13 @@ def is_rejection_candle(candle: Dict[str, Any], direction: str) -> bool:
 
     if direction == "LONG":
         bullish_close = candle["close"] > candle["open"]
-        lower_rejection = lower_wick >= body * 0.8 if body > 0 else lower_wick > 0
-        return bullish_close or lower_rejection or body_ratio >= 0.25
+        lower_rejection = lower_wick >= body * 1.2 if body > 0 else False
+        return bullish_close and (lower_rejection or body_ratio >= 0.35)
 
     if direction == "SHORT":
         bearish_close = candle["close"] < candle["open"]
-        upper_rejection = upper_wick >= body * 0.8 if body > 0 else upper_wick > 0
-        return bearish_close or upper_rejection or body_ratio >= 0.25
+        upper_rejection = upper_wick >= body * 1.2 if body > 0 else False
+        return bearish_close and (upper_rejection or body_ratio >= 0.35)
 
     return False
 
@@ -965,17 +965,14 @@ def assess_mitigation_quality(
             "quality": "Eski",
         }
 
-    recent_check = candles_5m[-2:] if len(candles_5m) >= 2 else [last]
-    rejection_ok = any(is_rejection_candle(x, direction) for x in recent_check)
-
-    if not rejection_ok:
-        return {
-            "valid": False,
-            "reason": "Rejection confirmation yok",
-            "touch_index": touch_index,
-            "bars_after_touch": bars_after_touch,
-            "quality": "Zayıf",
-        }
+    if not is_rejection_candle(last, direction):
+    return {
+        "valid": False,
+        "reason": "Rejection confirmation yok",
+        "touch_index": touch_index,
+        "bars_after_touch": bars_after_touch,
+        "quality": "Zayıf",
+    }
 
     return {
         "valid": True,
