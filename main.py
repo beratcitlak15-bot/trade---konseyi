@@ -41,7 +41,7 @@ TF_RULES = {
 SIGNAL_COOLDOWN_SECONDS = 60 * 60
 MAX_ACTIVE_SIGNAL_AGE_SECONDS = 60 * 60 * 24
 
-MAX_BARS_AFTER_MITIGATION = 3
+MAX_BARS_AFTER_MITIGATION = 4
 ENTRY_DISTANCE_MAX_MULTIPLIER = 0.80
 TP_PROGRESS_BLOCK_THRESHOLD = 0.55
 MIN_RR_REQUIRED = 1.4
@@ -923,13 +923,19 @@ def is_rejection_candle(candle: Dict[str, Any], direction: str) -> bool:
     if rng == 0:
         return False
 
+    upper_wick = candle["high"] - max(candle["open"], candle["close"])
+    lower_wick = min(candle["open"], candle["close"]) - candle["low"]
     body_ratio = body / rng
 
     if direction == "LONG":
-        return candle["close"] > candle["open"] and body_ratio >= 0.35
+        bullish_close = candle["close"] > candle["open"]
+        lower_rejection = lower_wick >= body * 0.8 if body > 0 else lower_wick > 0
+        return bullish_close or lower_rejection or body_ratio >= 0.25
 
     if direction == "SHORT":
-        return candle["close"] < candle["open"] and body_ratio >= 0.35
+        bearish_close = candle["close"] < candle["open"]
+        upper_rejection = upper_wick >= body * 0.8 if body > 0 else upper_wick > 0
+        return bearish_close or upper_rejection or body_ratio >= 0.25
 
     return False
 
@@ -959,7 +965,10 @@ def assess_mitigation_quality(
             "quality": "Eski",
         }
 
-    if not is_rejection_candle(last, direction):
+    recent_check = candles_5m[-2:] if len(candles_5m) >= 2 else [last]
+    rejection_ok = any(is_rejection_candle(x, direction) for x in recent_check)
+
+    if not rejection_ok:
         return {
             "valid": False,
             "reason": "Rejection confirmation yok",
