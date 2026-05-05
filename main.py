@@ -46,6 +46,17 @@ ENTRY_DISTANCE_MAX_MULTIPLIER = 0.80
 TP_PROGRESS_BLOCK_THRESHOLD = 0.55
 MIN_RR_REQUIRED = 1.4
 
+# Hazır sinyal filtresi
+MIN_SETUP_CONFIRM_CYCLES = 2
+PENDING_SETUP_MAX_AGE_SECONDS = 60 * 60 * 6
+
+MIN_TP_DISTANCE_5M_MULTIPLIER = 1.8
+MIN_SL_DISTANCE_5M_MULTIPLIER = 0.8
+MIN_REMAINING_TP_DISTANCE_5M_MULTIPLIER = 1.2
+
+REQUIRE_KILLZONE_FOR_OTE = True
+REQUIRE_STRUCTURE_FOR_OTE = True
+
 # Ek model ayarları
 ENABLE_IFVG_RECLAIM = True
 ENABLE_OTE_RETRACEMENT = True
@@ -247,14 +258,24 @@ def cache_is_fresh(symbol: str, interval: str, ttl: int) -> bool:
 def load_bot_state() -> Dict[str, Any]:
     data = load_json_file(BOT_STATE_FILE)
     if not data:
-        return {"signals": {}, "active_signals": {}, "performance": {}}
+        return {
+            "signals": {},
+            "active_signals": {},
+            "performance": {},
+            "pending_setups": {},
+        }
 
     if "signals" not in data or not isinstance(data["signals"], dict):
         data["signals"] = {}
+
     if "active_signals" not in data or not isinstance(data["active_signals"], dict):
         data["active_signals"] = {}
+
     if "performance" not in data or not isinstance(data["performance"], dict):
         data["performance"] = {}
+
+    if "pending_setups" not in data or not isinstance(data["pending_setups"], dict):
+        data["pending_setups"] = {}
 
     return data
 
@@ -1272,6 +1293,82 @@ def build_trade_levels(
     }
 
 
+def validate_absolute_trade_distances(
+    candles_5m: List[Dict[str, Any]],
+    entry: float,
+    sl: float,
+    tp: float,
+    current_price: float,
+) -> Dict[str, Any]:
+    avg_rng_5m = average_range(candles_5m[-12:], 12)
+
+    if avg_rng_5m <= 0:
+        return {"valid": False, "reason": "5m average range sıfır"}
+
+    tp_distance = abs(tp - entry)
+    sl_distance = abs(entry - sl)
+    remaining_tp_distance = abs(tp - current_price)
+
+    if tp_distance < (avg_rng_5m * MIN_TP_DISTANCE_5M_MULTIPLIER):
+        return {
+            "valid": False,
+            "reason": "TP mesafesi çok kısa",
+            "tp_distance": tp_distance,
+            "sl_distance": sl_distance,
+            "remaining_tp_distance": remaining_tp_distance,
+        }
+
+    if sl_distance < (avg_rng_5m * MIN_SL_DISTANCE_5M_MULTIPLIER):
+        return {
+            "valid": False,
+            "reason": "SL mesafesi çok kısa",
+            "tp_distance": tp_distance,
+            "sl_distance": sl_distance,
+            "remaining_tp_distance": remaining_tp_distance,
+        }
+
+    if remaining_tp_distance < (avg_rng_5m * MIN_REMAINING_TP_DISTANCE_5M_MULTIPLIER):
+        return {
+            "valid": False,
+            "reason": "Fiyat hedefe fazla yaklaşmış",
+            "tp_distance": tp_distance,
+            "sl_distance": sl_distance,
+            "remaining_tp_distance": remaining_tp_distance,
+        }
+
+    return {
+        "valid": True,
+        "reason": "Mutlak mesafeler uygun",
+        "tp_distance": tp_distance,
+        "sl_distance": sl_distance,
+        "remaining_tp_distance": remaining_tp_distance,
+    }
+
+
+def is_ready_trade_signal(
+    result: Dict[str, Any],
+    pending_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    setup_model = result.get("setup_model", "YOK")
+    killzone = result.get("killzone", "Killzone Dışı")
+    mss = result.get("mss", "Yok")
+    choch = result.get("choch", "Yok")
+    displacement = result.get("displacement", "Yok")
+
+    if int(pending_info.get("seen_count", 0)) < MIN_SETUP_CONFIRM_CYCLES:
+        return {"valid": False, "reason": "Setup henüz yeterince olgunlaşmadı"}
+
+    if setup_model == "OTE_RETRACEMENT":
+        if REQUIRE_KILLZONE_FOR_OTE and killzone == "Killzone Dışı":
+            return {"valid": False, "reason": "OTE killzone dışı"}
+
+        if REQUIRE_STRUCTURE_FOR_OTE:
+            has_structure = mss != "Yok" or choch != "Yok" or displacement == "Güçlü"
+            if not has_structure:
+                return {"valid": False, "reason": "OTE için yapı teyidi zayıf"}
+
+    return {"valid": True, "reason": "Ready signal"}
+
 # =========================================================
 # PERFORMANCE ADAPTATION
 # =========================================================
@@ -1292,6 +1389,7 @@ def get_performance_adjustment(state: Dict[str, Any], symbol: str) -> Tuple[int,
             notes.append("Symbol performansı zayıf")
 
     return adjustment, notes
+
 
 
 # =========================================================
@@ -1413,10 +1511,10 @@ def score_signal(
         notes.append("1H / 4H conflict")
 
     if setup_model == "IFVG_RECLAIM":
-        score += 3
+        score += 2
         notes.append("IFVG reclaim modeli")
     elif setup_model == "OTE_RETRACEMENT":
-        score += 2
+        score += 0
         notes.append("OTE retracement modeli")
 
     score += perf_adjustment
@@ -1437,9 +1535,9 @@ def score_signal(
 def build_signal_key(result: Dict[str, Any]) -> str:
     symbol = result["symbol"]
     direction = result["direction"]
-    entry = f"{result['entry']:.5f}" if isinstance(r := result.get("entry"), (int, float)) else "na"
-    sl = f"{result['sl']:.5f}" if isinstance(r := result.get("sl"), (int, float)) else "na"
-    tp = f"{result['tp']:.5f}" if isinstance(r := result.get("tp"), (int, float)) else "na"
+    entry = f"{result['entry']:.5f}" if isinstance(result.get("entry"), (int, float)) else "na"
+    sl = f"{result['sl']:.5f}" if isinstance(result.get("sl"), (int, float)) else "na"
+    tp = f"{result['tp']:.5f}" if isinstance(result.get("tp"), (int, float)) else "na"
     return f"{symbol}|{direction}|{entry}|{sl}|{tp}"
 
 
@@ -1477,6 +1575,56 @@ def mark_signal_sent(result: Dict[str, Any], state: Dict[str, Any]) -> None:
         "tp": result["tp"],
         "status": "OPEN",
     }
+
+
+def build_pending_setup_key(result: Dict[str, Any]) -> str:
+    symbol = result["symbol"]
+    direction = result["direction"]
+    model = result.get("setup_model", "YOK")
+    ob_low = f"{result['ob_low']:.5f}" if isinstance(result.get("ob_low"), (int, float)) else "na"
+    ob_high = f"{result['ob_high']:.5f}" if isinstance(result.get("ob_high"), (int, float)) else "na"
+    return f"{symbol}|{direction}|{model}|{ob_low}|{ob_high}"
+
+
+def update_pending_setup(state: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+    key = build_pending_setup_key(result)
+    bucket = state["pending_setups"].get(key)
+
+    if not bucket:
+        bucket = {
+            "first_seen_ts": now_ts(),
+            "last_seen_ts": now_ts(),
+            "seen_count": 1,
+            "symbol": result["symbol"],
+            "direction": result["direction"],
+            "setup_model": result.get("setup_model", "YOK"),
+        }
+        state["pending_setups"][key] = bucket
+        return bucket
+
+    bucket["last_seen_ts"] = now_ts()
+    bucket["seen_count"] = int(bucket.get("seen_count", 0)) + 1
+    return bucket
+
+
+def cleanup_pending_setups(state: Dict[str, Any]) -> None:
+    pending = state.get("pending_setups", {})
+    if not isinstance(pending, dict):
+        return
+
+    keys_to_delete = []
+
+    for key, item in pending.items():
+        last_seen_ts = item.get("last_seen_ts")
+        if not isinstance(last_seen_ts, int):
+            keys_to_delete.append(key)
+            continue
+
+        if (now_ts() - last_seen_ts) > PENDING_SETUP_MAX_AGE_SECONDS:
+            keys_to_delete.append(key)
+
+    for key in keys_to_delete:
+        pending.pop(key, None)
 
 
 def update_active_signals_outcomes(
@@ -1549,7 +1697,6 @@ def update_active_signals_outcomes(
 
     for key in keys_to_delete:
         state["active_signals"].pop(key, None)
-
 
 # =========================================================
 # DATA PREP
@@ -1666,6 +1813,17 @@ def analyze_forex_symbol(
         print(f"{market_name} -> entry timing filtresinden kaldı: {timing['reason']}")
         return None
 
+    distance_check = validate_absolute_trade_distances(
+        candles_5m=candles_5m,
+        entry=levels["entry"],
+        sl=levels["sl"],
+        tp=levels["tp"],
+        current_price=current_price,
+    )
+    if not distance_check["valid"]:
+        print(f"{market_name} -> mesafe filtresinden kaldı: {distance_check['reason']}")
+        return None
+
     smt = detect_forex_smt(market_name, mtf_map)
     perf_adjustment, perf_notes = get_performance_adjustment(state, market_name)
 
@@ -1689,7 +1847,11 @@ def analyze_forex_symbol(
     )
 
     risk = abs(levels["entry"] - levels["sl"])
-    partial_tp = round_price(levels["entry"] + risk) if direction == "LONG" else round_price(levels["entry"] - risk)
+    partial_tp = (
+        round_price(levels["entry"] + risk)
+        if direction == "LONG"
+        else round_price(levels["entry"] - risk)
+    )
     be_trigger = partial_tp
     invalidation = levels["sl"]
     entry_distance = timing.get("entry_distance")
@@ -1723,13 +1885,24 @@ def analyze_forex_symbol(
         "mitigation_reason": mitigation["reason"],
         "bars_after_touch": mitigation["bars_after_touch"],
         "entry_distance": round_price(entry_distance) if isinstance(entry_distance, float) else entry_distance,
+        "tp_distance": round_price(distance_check["tp_distance"]) if isinstance(distance_check.get("tp_distance"), float) else distance_check.get("tp_distance"),
+        "sl_distance": round_price(distance_check["sl_distance"]) if isinstance(distance_check.get("sl_distance"), float) else distance_check.get("sl_distance"),
+        "remaining_tp_distance": round_price(distance_check["remaining_tp_distance"]) if isinstance(distance_check.get("remaining_tp_distance"), float) else distance_check.get("remaining_tp_distance"),
         "partial_tp": partial_tp,
         "be_trigger": be_trigger,
         "invalidation": invalidation,
         "score_notes": score_notes,
         "setup_model": setup_model,
         "model_reason": alt_model_info["reason"] if alt_model_info else "Primary sniper model",
-        "reason": "Sniper entry zone aktif" if quality in ("A", "A+") else "Setup var ama kalite filtresi yetersiz",
+        "reason": (
+            "Sniper entry zone aktif"
+            if setup_model == "SNIPER_OB" and quality in ("A", "A+")
+            else "IFVG reclaim hazır"
+            if setup_model == "IFVG_RECLAIM" and quality in ("A", "A+")
+            else "OTE retracement hazır"
+            if setup_model == "OTE_RETRACEMENT" and quality in ("A", "A+")
+            else "Setup var ama kalite filtresi yetersiz"
+        ),
     }
 
 
@@ -1748,6 +1921,9 @@ def format_signal_message(r: Dict[str, Any]) -> str:
     be_trigger = f"{r['be_trigger']:.5f}" if isinstance(r.get("be_trigger"), (int, float)) else "Yok"
     invalidation = f"{r['invalidation']:.5f}" if isinstance(r.get("invalidation"), (int, float)) else "Yok"
     entry_distance = f"{r['entry_distance']:.5f}" if isinstance(r.get("entry_distance"), (int, float)) else str(r.get("entry_distance", "Yok"))
+    tp_distance = f"{r['tp_distance']:.5f}" if isinstance(r.get("tp_distance"), (int, float)) else str(r.get("tp_distance", "Yok"))
+    sl_distance = f"{r['sl_distance']:.5f}" if isinstance(r.get("sl_distance"), (int, float)) else str(r.get("sl_distance", "Yok"))
+    remaining_tp_distance = f"{r['remaining_tp_distance']:.5f}" if isinstance(r.get("remaining_tp_distance"), (int, float)) else str(r.get("remaining_tp_distance", "Yok"))
     score_notes = ", ".join(r.get("score_notes", [])[:5]) if isinstance(r.get("score_notes"), list) else "Yok"
 
     parts = [
@@ -1786,12 +1962,14 @@ def format_signal_message(r: Dict[str, Any]) -> str:
         f"Move BE After: {be_trigger}",
         f"Invalidation: {invalidation}",
         f"Distance to Entry: {entry_distance}",
+        f"TP Distance: {tp_distance}",
+        f"SL Distance: {sl_distance}",
+        f"Remaining TP Distance: {remaining_tp_distance}",
         "",
         f"Notes: {score_notes}",
         f"Reason: {r.get('reason', 'Yok')}",
     ]
     return "\n".join(parts)
-
 
 # =========================================================
 # RUN
@@ -1814,6 +1992,7 @@ def run_scan() -> int:
     state = load_bot_state()
 
     update_active_signals_outcomes(state, mtf_map)
+    cleanup_pending_setups(state)
 
     total_signals = 0
 
@@ -1827,11 +2006,19 @@ def run_scan() -> int:
 
         print(
             f"{name} -> yön: {result['direction']}, "
-            f"skor: {result['score']}, kalite: {result['quality']}, rr: {result.get('rr')}, model: {result.get('setup_model')}"
+            f"skor: {result['score']}, kalite: {result['quality']}, "
+            f"rr: {result.get('rr')}, model: {result.get('setup_model')}"
         )
 
         if result["score"] < MIN_SIGNAL_SCORE or result["quality"] not in ("A", "A+"):
             print(f"{name} -> setup var ama kalite filtresini geçemedi")
+            continue
+
+        pending_info = update_pending_setup(state, result)
+
+        ready_check = is_ready_trade_signal(result, pending_info)
+        if not ready_check["valid"]:
+            print(f"{name} -> iç takipte bekliyor: {ready_check['reason']}")
             continue
 
         if should_skip_repeated_signal(result, state):
@@ -1844,7 +2031,7 @@ def run_scan() -> int:
         if sent:
             total_signals += 1
             mark_signal_sent(result, state)
-            print(f"{name} -> SIGNAL GÖNDERİLDİ")
+            print(f"{name} -> READY SIGNAL GÖNDERİLDİ")
         else:
             print(f"{name} -> sinyal gönderilemedi")
 
