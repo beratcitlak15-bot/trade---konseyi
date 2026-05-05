@@ -946,12 +946,24 @@ def assess_mitigation_quality(
     direction: str,
 ) -> Dict[str, Any]:
     if len(candles_5m) < 6:
-        return {"valid": False, "reason": "5m veri yetersiz", "touch_index": None, "bars_after_touch": None, "quality": "Yok"}
+        return {
+            "valid": False,
+            "reason": "5m veri yetersiz",
+            "touch_index": None,
+            "bars_after_touch": None,
+            "quality": "Yok",
+        }
 
     touch_index = find_latest_ob_touch_index(candles_5m, ob)
 
     if touch_index is None:
-        return {"valid": False, "reason": "OB touch yok", "touch_index": None, "bars_after_touch": None, "quality": "Yok"}
+        return {
+            "valid": False,
+            "reason": "OB touch yok",
+            "touch_index": None,
+            "bars_after_touch": None,
+            "quality": "Yok",
+        }
 
     bars_after_touch = len(candles_5m) - 1 - touch_index
     last = candles_5m[-1]
@@ -966,13 +978,13 @@ def assess_mitigation_quality(
         }
 
     if not is_rejection_candle(last, direction):
-    return {
-        "valid": False,
-        "reason": "Rejection confirmation yok",
-        "touch_index": touch_index,
-        "bars_after_touch": bars_after_touch,
-        "quality": "Zayıf",
-    }
+        return {
+            "valid": False,
+            "reason": "Rejection confirmation yok",
+            "touch_index": touch_index,
+            "bars_after_touch": bars_after_touch,
+            "quality": "Zayıf",
+        }
 
     return {
         "valid": True,
