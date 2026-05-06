@@ -47,11 +47,11 @@ TP_PROGRESS_BLOCK_THRESHOLD = 0.55
 MIN_RR_REQUIRED = 1.4
 
 # Hazır sinyal filtresi
-MIN_SETUP_CONFIRM_CYCLES = 2
+MIN_SETUP_CONFIRM_CYCLES = 1
 PENDING_SETUP_MAX_AGE_SECONDS = 60 * 60 * 6
 
-MIN_TP_DISTANCE_5M_MULTIPLIER = 1.8
-MIN_SL_DISTANCE_5M_MULTIPLIER = 0.8
+MIN_TP_DISTANCE_5M_MULTIPLIER = 1.4
+MIN_SL_DISTANCE_5M_MULTIPLIER = 0.6
 MIN_REMAINING_TP_DISTANCE_5M_MULTIPLIER = 1.2
 
 REQUIRE_KILLZONE_FOR_OTE = True
@@ -951,12 +951,12 @@ def is_rejection_candle(candle: Dict[str, Any], direction: str) -> bool:
     if direction == "LONG":
         bullish_close = candle["close"] > candle["open"]
         lower_rejection = lower_wick >= body * 1.2 if body > 0 else False
-        return bullish_close and (lower_rejection or body_ratio >= 0.35)
+        return bullish_close and (lower_rejection or body_ratio >= 0.25)
 
     if direction == "SHORT":
         bearish_close = candle["close"] < candle["open"]
         upper_rejection = upper_wick >= body * 1.2 if body > 0 else False
-        return bearish_close and (upper_rejection or body_ratio >= 0.35)
+        return bearish_close and (upper_rejection or body_ratio >= 0.25)
 
     return False
 
