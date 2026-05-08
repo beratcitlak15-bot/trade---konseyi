@@ -28,6 +28,8 @@ DUKASCOPY_TF_VARIANTS = {
     "1week": ["Weekly", "1 Week", "1Week", "W1", "1W", "weekly", "1_Week"],
 }
 
+DUKASCOPY_TF_MAP = {k: v[0] for k, v in DUKASCOPY_TF_VARIANTS.items()}
+
 DUKASCOPY_SYM_MAP = {
     "EUR/USD": "EURUSD",
     "GBP/USD": "GBPUSD",
@@ -130,13 +132,20 @@ def parse_dt(s: str) -> Optional[datetime]:
 
 
 def normalize_name(s: str) -> str:
-    return (
-        s.lower()
-        .replace("-", " ")
-        .replace("_", " ")
-        .replace(" ", " ")
-        .strip()
-    )
+    s = s.lower()
+
+    for ch in ["-", "_", ".", "(", ")", "[", "]"]:
+        s = s.replace(ch, " ")
+
+    s = " ".join(s.split())
+
+    s = s.replace("mins", " min")
+    s = s.replace("hours", " hour")
+    s = s.replace("hourly", " hour")
+    s = s.replace("weekly", " week")
+
+    s = " ".join(s.split())
+    return s
 
 
 def find_file(sym: str, tf: str) -> Optional[str]:
@@ -145,6 +154,7 @@ def find_file(sym: str, tf: str) -> Optional[str]:
         return None
 
     tf_variants = DUKASCOPY_TF_VARIANTS.get(tf, [])
+
     patterns = [f"{s}*.csv", f"{s}*.xls", f"{s}*.xlsx"]
 
     all_sym_files: List[str] = []
@@ -158,7 +168,10 @@ def find_file(sym: str, tf: str) -> Optional[str]:
     if not bid_files:
         bid_files = all_sym_files
 
-    normalized_files = [(f, normalize_name(os.path.basename(f))) for f in bid_files]
+    normalized_files = [
+        (f, normalize_name(os.path.basename(f)))
+        for f in bid_files
+    ]
 
     for tf_name in tf_variants:
         tf_norm = normalize_name(tf_name)
